@@ -67,6 +67,74 @@ wifi-button-arduino/            # Example generated Arduino sketch
 wifi-button.ino/                # Additional sketch variant
 ```
 
+## Connection & Wake-up Flow
+
+Every button press triggers a full boot from deep sleep. The sketch is optimized to minimize the time from wake-up to HTTP request:
+
+```
+Wake (GPIO LOW)
+  │
+  ├─ Peripheral power pin → OFF + hold (before anything else)
+  ├─ Check wakeup cause (GPIO / other)
+  │
+  ├─ WiFi config: static IP, TX power, no power save
+  │
+  ├─ RTC cache available? ──Yes──► WiFi.begin(SSID, PW, channel, BSSID)  ← skips scan
+  │         │                                │
+  │         No                         connected < 4s?
+  │         │                                │
+  │         └──► full scan              No → fallback to full scan, clear cache
+  │
+  ├─ Connected → save channel + BSSID to RTC memory
+  │            → send HTTP request
+  │            → deep sleep
+  │
+  └─ Timeout  → clear RTC cache
+               → maintenance window (5s for OTA/serial)
+               → deep sleep
+```
+
+### WiFi Speed Optimizations
+
+| Technique | Saves |
+|---|---|
+| Static IP (no DHCP) | ~1000 ms |
+| RTC cache: BSSID + channel (skips AP scan) | ~300–500 ms |
+| Max TX power (19.5 dBm) | faster association |
+| `WiFi.persistent(false)` | no flash write on connect |
+| `WIFI_FAST_SCAN` | stops after first matching AP |
+
+### RTC Memory Cache
+
+The advanced sketch (`wifi-button.ino`) stores WiFi channel and BSSID in **RTC memory** (`RTC_DATA_ATTR`), which survives deep sleep. On the next wakeup the device connects directly to the known AP without scanning:
+
+```cpp
+RTC_DATA_ATTR int     savedChannel = 0;
+RTC_DATA_ATTR uint8_t savedBSSID[6] = {0};
+RTC_DATA_ATTR bool    hasCachedWiFi = false;
+```
+
+If the cached connect fails after 4 seconds (AP rebooted, channel changed), it automatically falls back to a full scan and resets the cache.
+
+### HTTP Fire-and-Forget
+
+The advanced sketch uses a raw `WiFiClient` instead of `HTTPClient`. It sends the HTTP request and disconnects immediately without waiting for the full response — reducing uptime by ~100–200 ms:
+
+```
+client.connect(host, port)
+  → send GET request
+  → flush + disconnect
+  → enter deep sleep
+```
+
+### Peripheral Power Pin
+
+An optional GPIO can cut power to external peripherals (e.g. LEDs, sensors) during deep sleep. The pin state is held via `gpio_hold_en()` so it stays LOW even while the chip is asleep — no leakage current through the peripheral.
+
+### Maintenance Window
+
+If WiFi fails, the device stays awake for `MAINTENANCE_MS` (default 5 s) before sleeping again. This allows serial debugging or OTA updates even when the network is unreachable.
+
 ## ESPHome Alternative
 
 `wifi-button.yaml` provides an ESPHome-based alternative for development and debugging — useful for OTA updates and logging without reflashing via USB.
