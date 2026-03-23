@@ -1,0 +1,26 @@
+{
+  "device_name": "wifi-button",
+  "wifi_ssid": "TPPP",
+  "wifi_password": "Synthese734#",
+  "use_static_ip": true,
+  "static_ip": "192.168.2.123",
+  "gateway": "192.168.2.1",
+  "subnet": "255.255.255.0",
+  "dns": "8.8.8.8",
+  "wakeup_pin": 2,
+  "wakeup_level": "LOW",
+  "peripheral_power_pin": -1,
+  "peripheral_power_active": "HIGH",
+  "wifi_timeout_ms": 5000,
+  "http_timeout_ms": 3000,
+  "maintenance_ms": 5000,
+  "wifi_tx_power": "20dBm",
+  "wifi_power_save": false,
+  "buttons": [
+    {
+      "name": "Button 1",
+      "url": "http://192.168.2.175/cgi-bin/index.cgi?webif-pass=St@25rten&spotrequest=test1.mp3",
+      "method": "GET"
+    }
+  ]
+}

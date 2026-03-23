@@ -1,0 +1,47 @@
+esphome:
+  name: wifi-button
+  friendly_name: "WiFi Button (Debug)"
+
+esp32:
+  board: adafruit_feather_esp32c6
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+
+ota:
+  platform: esphome
+
+wifi:
+  ssid: "pos2.4"
+  password: "posadm1n"
+  manual_ip:
+    static_ip: 192.168.2.125
+    gateway: 192.168.2.1
+    subnet: 255.255.255.0
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO2
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Taster"
+    on_press:
+      then:
+        - logger.log: "Button pressed!"
+        - http_request.get:
+            url: "http://192.168.2.250/cgi-bin/index.cgi?webif-pass=St%4025rten&spotrequest=test1.mp3"
+            on_response:
+              then:
+                - logger.log:
+                    format: "HTTP: %d"
+                    args: [response->status_code]
+
+http_request:
+  useragent: esphome/device
+  timeout: 3s
