@@ -23,9 +23,7 @@ DEFAULT_CONFIG = {
     "dns": "8.8.8.8",
     "wakeup_pin": 2,
     "wakeup_level": "LOW",
-    "peripheral_power_pin": -1,
-    "peripheral_power_active": "HIGH",
-    "wifi_timeout_ms": 5000,
+    "wifi_timeout_ms": 10000,
     "http_timeout_ms": 3000,
     "maintenance_ms": 5000,
     "wifi_tx_power": "20dBm",
@@ -33,7 +31,7 @@ DEFAULT_CONFIG = {
     "buttons": [
         {
             "name": "Button 1",
-            "url": "http://192.168.2.175/cgi-bin/index.cgi?webif-pass=St@25rten&spotrequest=test1.mp3",
+            "url": "http://192.168.2.175/cgi-bin/index.cgi?webif-pass=1&spotrequest=test1.mp3",
             "method": "GET",
         }
     ],
@@ -51,6 +49,35 @@ TX_POWER_MAP = {
     "2dBm": "WIFI_POWER_2dBm",
 }
 
+# Adafruit Feather ESP32-C6 pin names → GPIO number
+# RTC pins (GPIO0-7) marked with ★
+FEATHER_PINS = [
+    ("A0 / IO1 ★", 1),
+    ("A1 / IO4 ★", 4),
+    ("A2 / IO6 ★", 6),
+    ("A3 / IO5 ★", 5),
+    ("A4 / IO3 ★", 3),
+    ("A5 / IO2 ★", 2),
+    ("IO0 ★", 0),
+    ("IO7 ★", 7),
+    ("IO8", 8),
+    ("IO9 (BUTTON)", 9),
+    ("IO12", 12),
+    ("IO14", 14),
+    ("IO15 (LED)", 15),
+    ("IO16 (TX)", 16),
+    ("IO17 (RX)", 17),
+    ("IO18 (SCL)", 18),
+    ("IO19 (SDA)", 19),
+    ("IO20 (I2C_PWR)", 20),
+    ("IO21 (SCK)", 21),
+    ("IO22 (MOSI)", 22),
+    ("IO23 (MISO)", 23),
+]
+FEATHER_PIN_LABELS = [p[0] for p in FEATHER_PINS]
+FEATHER_PIN_GPIO = {p[0]: p[1] for p in FEATHER_PINS}
+FEATHER_GPIO_LABEL = {p[1]: p[0] for p in FEATHER_PINS}
+
 
 # ── Code Generator ────────────────────────────────────────────────────────────
 
@@ -62,8 +89,23 @@ def generate_ino(cfg: dict) -> str:
     def L(text=""):
         lines.append(text)
 
+    # Parse URLs into host/port/path for fire-and-forget
+    import re
+    parsed_urls = []
+    for btn in cfg["buttons"]:
+        url = btn["url"]
+        m = re.match(r'https?://([^/:]+)(?::(\d+))?(/.*)$', url)
+        if m:
+            parsed_urls.append({
+                "host": m.group(1),
+                "port": int(m.group(2)) if m.group(2) else 80,
+                "path": m.group(3),
+                "method": btn.get("method", "GET"),
+            })
+        else:
+            parsed_urls.append({"host": "", "port": 80, "path": url, "method": btn.get("method", "GET")})
+
     L('#include <WiFi.h>')
-    L('#include <HTTPClient.h>')
     L('#include <esp_sleep.h>')
     L('#include <driver/gpio.h>')
     L()
@@ -80,13 +122,13 @@ def generate_ino(cfg: dict) -> str:
             L(f'const IPAddress {name}({", ".join(octets)});')
         L()
 
-    for i, btn in enumerate(cfg["buttons"]):
-        L(f'const char* HTTP_URL_{i} = "{btn["url"]}";')
+    for i, pu in enumerate(parsed_urls):
+        L(f'const char* HTTP_HOST_{i} = "{pu["host"]}";')
+        L(f'const int   HTTP_PORT_{i} = {pu["port"]};')
+        L(f'const char* HTTP_PATH_{i} = "{pu["path"]}";')
     L()
 
     L(f'const gpio_num_t WAKEUP_PIN = GPIO_NUM_{cfg["wakeup_pin"]};')
-    if cfg["peripheral_power_pin"] >= 0:
-        L(f'const gpio_num_t PERIPHERAL_POWER = GPIO_NUM_{cfg["peripheral_power_pin"]};')
     L()
 
     L(f'const unsigned long WIFI_TIMEOUT_MS = {cfg["wifi_timeout_ms"]};')
@@ -94,26 +136,27 @@ def generate_ino(cfg: dict) -> str:
     L(f'const unsigned long MAINTENANCE_MS  = {cfg["maintenance_ms"]};')
     L()
 
-    L('void sendHttpRequest(const char* url, const char* method);')
+    L('// WiFi cache survives deep sleep')
+    L('RTC_DATA_ATTR int savedChannel = 0;')
+    L('RTC_DATA_ATTR uint8_t savedBSSID[6] = {0};')
+    L('RTC_DATA_ATTR bool hasCachedWiFi = false;')
+    L()
+
+    L('void sendHttpRequest(const char* host, int port, const char* path, const char* method);')
     L('void enterDeepSleep();')
     L()
 
     # ── setup()
     L('// ---- Setup (runs once on every wake) ----')
     L('void setup() {')
-
-    if cfg["peripheral_power_pin"] >= 0:
-        active = 1 if cfg["peripheral_power_active"] == "HIGH" else 0
-        inactive = 0 if active == 1 else 1
-        L('  // Peripheral power off + hold through deep sleep')
-        L('  gpio_set_direction(PERIPHERAL_POWER, GPIO_MODE_OUTPUT);')
-        L(f'  gpio_set_level(PERIPHERAL_POWER, {inactive});')
-        L('  gpio_hold_en(PERIPHERAL_POWER);')
-        L()
-
-    L('  Serial.begin(115200);')
+    L('  // STEMMA QT / NeoPixel power off + hold through deep sleep')
+    L('  gpio_set_direction(GPIO_NUM_20, GPIO_MODE_OUTPUT);')
+    L('  gpio_set_level(GPIO_NUM_20, 0);')
+    L('  gpio_hold_en(GPIO_NUM_20);')
     L()
-    L('  // Log wakeup cause')
+    L('  Serial.begin(115200);')
+    L('  delay(50);')
+    L()
     L('  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();')
     L('  if (cause == ESP_SLEEP_WAKEUP_GPIO) {')
     L('    Serial.println("GPIO wakeup - button pressed");')
@@ -122,34 +165,63 @@ def generate_ino(cfg: dict) -> str:
     L('  }')
     L()
 
+    L('  WiFi.persistent(false);')
     if cfg["use_static_ip"]:
-        L('  // Static IP (skips DHCP — saves ~1s)')
         L('  WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS);')
 
     tx = TX_POWER_MAP.get(cfg["wifi_tx_power"], "WIFI_POWER_19_5dBm")
     L(f'  WiFi.setTxPower({tx});')
     L(f'  WiFi.setSleep({"true" if cfg["wifi_power_save"] else "false"});')
     L('  WiFi.mode(WIFI_STA);')
-    L('  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);')
+    L('  WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK);')
+    L('  WiFi.setScanMethod(WIFI_FAST_SCAN);')
+    L('  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);')
+    L()
+    L('  // Use cached BSSID + channel if available (skips scan)')
+    L('  if (hasCachedWiFi && savedChannel > 0) {')
+    L('    Serial.printf("Fast connect: CH %d, BSSID %02X:%02X:%02X:%02X:%02X:%02X\\n",')
+    L('      savedChannel, savedBSSID[0], savedBSSID[1], savedBSSID[2],')
+    L('      savedBSSID[3], savedBSSID[4], savedBSSID[5]);')
+    L('    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, savedChannel, savedBSSID);')
+    L('  } else {')
+    L('    Serial.println("No cache, full scan");')
+    L('    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);')
+    L('  }')
     L()
     L('  Serial.println("Connecting WiFi...");')
     L()
     L('  unsigned long start = millis();')
     L('  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) {')
-    L('    delay(10);')
+    L('    // Cached connect failed? Retry with full scan')
+    L('    if (hasCachedWiFi && millis() - start > 4000 && WiFi.status() != WL_CONNECTED) {')
+    L('      Serial.println("Cache miss - fallback to full scan");')
+    L('      hasCachedWiFi = false;')
+    L('      WiFi.disconnect();')
+    L('      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);')
+    L('    }')
+    L('    delay(100);')
+    L('    if ((millis() - start) % 1000 < 100) {')
+    L('      Serial.printf("  WiFi status: %d (%lu ms)\\n", WiFi.status(), millis() - start);')
+    L('    }')
     L('  }')
     L()
     L('  if (WiFi.status() == WL_CONNECTED) {')
-    L('    Serial.printf("WiFi OK (%lu ms)\\n", millis() - start);')
+    L('    savedChannel = WiFi.channel();')
+    L('    memcpy(savedBSSID, WiFi.BSSID(), 6);')
+    L('    hasCachedWiFi = true;')
+    L()
+    L('    Serial.printf("WiFi OK (%lu ms), IP: %s, CH: %d\\n",')
+    L('      millis() - start, WiFi.localIP().toString().c_str(), savedChannel);')
 
-    for i, btn in enumerate(cfg["buttons"]):
-        method = btn.get("method", "GET")
-        L(f'    sendHttpRequest(HTTP_URL_{i}, "{method}");')
+    for i, pu in enumerate(parsed_urls):
+        L(f'    sendHttpRequest(HTTP_HOST_{i}, HTTP_PORT_{i}, HTTP_PATH_{i}, "{pu["method"]}");')
 
-    L('    delay(200);')
     L('    enterDeepSleep();')
     L('  } else {')
-    L('    Serial.println("WiFi failed, maintenance window");')
+    L('    Serial.printf("WiFi FAILED after %lu ms, status: %d\\n", millis() - start, WiFi.status());')
+    L('    hasCachedWiFi = false;')
+    L('    savedChannel = 0;')
+    L('    Serial.println("Maintenance window");')
     L('    delay(MAINTENANCE_MS);')
     L('    enterDeepSleep();')
     L('  }')
@@ -157,39 +229,35 @@ def generate_ino(cfg: dict) -> str:
     L()
 
     L('void loop() {')
-    L('  // Never reached — device sleeps after setup()')
     L('}')
     L()
 
-    # ── HTTP Request
-    L('// ---- HTTP Request ----')
-    L('void sendHttpRequest(const char* url, const char* method) {')
-    L('  HTTPClient http;')
-    L('  http.setConnectTimeout(HTTP_TIMEOUT_MS);')
-    L('  http.setTimeout(HTTP_TIMEOUT_MS);')
-    L('  http.setUserAgent("wifi-button/1.0");')
-    L('  http.begin(url);')
+    # ── HTTP Fire-and-Forget
+    L('// ---- HTTP Fire-and-Forget ----')
+    L('void sendHttpRequest(const char* host, int port, const char* path, const char* method) {')
+    L('  Serial.printf("HTTP %s %s%s\\n", method, host, path);')
+    L('  unsigned long httpStart = millis();')
     L()
-    L('  int code;')
-    L('  if (strcmp(method, "POST") == 0) {')
-    L('    code = http.POST("");')
+    L('  WiFiClient client;')
+    L('  if (client.connect(host, port, HTTP_TIMEOUT_MS)) {')
+    L('    client.printf("%s %s HTTP/1.0\\r\\n"')
+    L('                  "Host: %s\\r\\n"')
+    L('                  "Connection: close\\r\\n\\r\\n",')
+    L('                  method, path, host);')
+    L('    client.flush();')
+    L('    delay(100);')
+    L('    client.stop();')
+    L('    Serial.printf("HTTP sent (%lu ms)\\n", millis() - httpStart);')
     L('  } else {')
-    L('    code = http.GET();')
+    L('    Serial.printf("HTTP connect failed (%lu ms)\\n", millis() - httpStart);')
     L('  }')
-    L()
-    L('  if (code > 0) {')
-    L('    Serial.printf("HTTP %s -> %d\\n", method, code);')
-    L('  } else {')
-    L('    Serial.printf("HTTP failed: %s\\n", http.errorToString(code).c_str());')
-    L('  }')
-    L('  http.end();')
     L('}')
     L()
 
     # ── Deep Sleep (C6 specific)
     L('// ---- Deep Sleep (ESP32-C6) ----')
     L('void enterDeepSleep() {')
-    L('  Serial.println("Sleeping...");')
+    L('  Serial.printf("Sleeping after %lu ms total uptime\\n", millis());')
     L('  Serial.flush();')
     L()
     L('  WiFi.disconnect(true);')
@@ -197,6 +265,15 @@ def generate_ino(cfg: dict) -> str:
     L()
 
     wakeup_level = "ESP_GPIO_WAKEUP_GPIO_LOW" if cfg["wakeup_level"] == "LOW" else "ESP_GPIO_WAKEUP_GPIO_HIGH"
+
+    if cfg["wakeup_level"] == "LOW":
+        L('  gpio_pullup_en(WAKEUP_PIN);')
+        L('  gpio_pulldown_dis(WAKEUP_PIN);')
+    else:
+        L('  gpio_pulldown_en(WAKEUP_PIN);')
+        L('  gpio_pullup_dis(WAKEUP_PIN);')
+
+    L()
     L(f'  esp_deep_sleep_enable_gpio_wakeup(1ULL << WAKEUP_PIN, {wakeup_level});')
     L()
     L('  esp_deep_sleep_start();')
@@ -335,12 +412,15 @@ class WifiButtonBuilder(tk.Tk):
         ttk.Checkbutton(f, text="Power Save", variable=self.power_save_var).grid(row=row, column=2, columnspan=2, sticky="w", pady=(4, 0))
 
     def _build_gpio_section(self):
-        f = ttk.LabelFrame(self.scroll_frame, text="GPIO", padding=8)
+        f = ttk.LabelFrame(self.scroll_frame, text="GPIO (★ = RTC / Deep Sleep fähig)", padding=8)
         f.pack(fill="x", pady=(0, 6))
 
-        ttk.Label(f, text="Wakeup Pin (GPIO0-7 = RTC):").grid(row=0, column=0, sticky="w")
-        self.wakeup_pin_var = tk.IntVar(value=self.config_data["wakeup_pin"])
-        ttk.Spinbox(f, from_=0, to=30, textvariable=self.wakeup_pin_var, width=6).grid(row=0, column=1, sticky="w", padx=(4, 0))
+        ttk.Label(f, text="Wakeup Pin:").grid(row=0, column=0, sticky="w")
+        default_label = FEATHER_GPIO_LABEL.get(self.config_data["wakeup_pin"], f"IO{self.config_data['wakeup_pin']}")
+        self.wakeup_pin_var = tk.StringVar(value=default_label)
+        ttk.Combobox(f, textvariable=self.wakeup_pin_var, values=FEATHER_PIN_LABELS, width=20, state="readonly").grid(
+            row=0, column=1, sticky="w", padx=(4, 0)
+        )
 
         ttk.Label(f, text="  Wakeup Level:").grid(row=0, column=2, sticky="w")
         self.wakeup_level_var = tk.StringVar(value=self.config_data["wakeup_level"])
@@ -348,14 +428,8 @@ class WifiButtonBuilder(tk.Tk):
             row=0, column=3, sticky="w", padx=(4, 0)
         )
 
-        ttk.Label(f, text="Peripheral Power Pin (-1 = aus):").grid(row=1, column=0, sticky="w", pady=(4, 0))
-        self.periph_pin_var = tk.IntVar(value=self.config_data["peripheral_power_pin"])
-        ttk.Spinbox(f, from_=-1, to=30, textvariable=self.periph_pin_var, width=6).grid(row=1, column=1, sticky="w", padx=(4, 0), pady=(4, 0))
-
-        ttk.Label(f, text="  Active:").grid(row=1, column=2, sticky="w", pady=(4, 0))
-        self.periph_active_var = tk.StringVar(value=self.config_data["peripheral_power_active"])
-        ttk.Combobox(f, textvariable=self.periph_active_var, values=["HIGH", "LOW"], width=6, state="readonly").grid(
-            row=1, column=3, sticky="w", padx=(4, 0), pady=(4, 0)
+        ttk.Label(f, text="IO20 (STEMMA QT / NeoPixel Power) ist immer aus.", foreground="gray").grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(4, 0)
         )
 
     def _build_timing_section(self):
@@ -416,6 +490,9 @@ class WifiButtonBuilder(tk.Tk):
         ttk.Button(f, text="Config laden", command=self._load_config).pack(side="left", padx=(0, 6))
 
     def _gather_config(self) -> dict:
+        wakeup_label = self.wakeup_pin_var.get()
+        wakeup_gpio = FEATHER_PIN_GPIO.get(wakeup_label, 2)
+
         return {
             "device_name": self.device_name_var.get(),
             "wifi_ssid": self.ssid_var.get(),
@@ -425,10 +502,8 @@ class WifiButtonBuilder(tk.Tk):
             "gateway": self.ip_vars["gateway"].get(),
             "subnet": self.ip_vars["subnet"].get(),
             "dns": self.ip_vars["dns"].get(),
-            "wakeup_pin": self.wakeup_pin_var.get(),
+            "wakeup_pin": wakeup_gpio,
             "wakeup_level": self.wakeup_level_var.get(),
-            "peripheral_power_pin": self.periph_pin_var.get(),
-            "peripheral_power_active": self.periph_active_var.get(),
             "wifi_timeout_ms": self.timing_vars["wifi_timeout_ms"].get(),
             "http_timeout_ms": self.timing_vars["http_timeout_ms"].get(),
             "maintenance_ms": self.timing_vars["maintenance_ms"].get(),
@@ -510,15 +585,15 @@ class WifiButtonBuilder(tk.Tk):
         for key in ["static_ip", "gateway", "subnet", "dns"]:
             if key in self.ip_vars:
                 self.ip_vars[key].set(cfg.get(key, ""))
-        self.wakeup_pin_var.set(cfg.get("wakeup_pin", 2))
+        wakeup_gpio = cfg.get("wakeup_pin", 2)
+        self.wakeup_pin_var.set(FEATHER_GPIO_LABEL.get(wakeup_gpio, f"IO{wakeup_gpio}"))
         self.wakeup_level_var.set(cfg.get("wakeup_level", "LOW"))
-        self.periph_pin_var.set(cfg.get("peripheral_power_pin", -1))
-        self.periph_active_var.set(cfg.get("peripheral_power_active", "HIGH"))
         self.tx_power_var.set(cfg.get("wifi_tx_power", "20dBm"))
         self.power_save_var.set(cfg.get("wifi_power_save", False))
-        for key in ["wifi_timeout_ms", "http_timeout_ms", "maintenance_ms"]:
+        timing_defaults = {"wifi_timeout_ms": 10000, "http_timeout_ms": 3000, "maintenance_ms": 5000}
+        for key in timing_defaults:
             if key in self.timing_vars:
-                self.timing_vars[key].set(cfg.get(key, 5000))
+                self.timing_vars[key].set(cfg.get(key, timing_defaults[key]))
 
         for ed in self.button_editors:
             ed.destroy()
