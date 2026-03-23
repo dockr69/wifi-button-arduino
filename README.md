@@ -6,14 +6,21 @@ A graphical tool for generating Arduino `.ino` sketches for battery-powered **Wi
 
 ## Quick Start
 
+**macOS / Linux**
 ```bash
-# 1. Launch the GUI
 python wifi_button_builder.py
-
-# 2. Fill in WiFi credentials, static IP, and button URLs
-# 3. Click "Exportieren (.ino)" to save the sketch
-# 4. Open the .ino file in Arduino IDE and flash to the board
 ```
+
+**Windows**
+```cmd
+python wifi_button_builder.py
+```
+
+> On Linux, Tkinter may need to be installed separately — see [Installation](#installation).
+
+1. Fill in WiFi credentials, static IP, and button URLs
+2. Click **Exportieren (.ino)** to save the sketch
+3. Open the `.ino` file in Arduino IDE and flash to the board
 
 ---
 
@@ -36,8 +43,7 @@ python wifi_button_builder.py
 - Python 3.10+
 - [Arduino IDE 2.x](https://www.arduino.cc/en/software)
 - ESP32 Arduino Core 3.x (via Arduino Board Manager)
-
-> Tkinter is included with standard Python on most platforms. No additional Python packages required.
+- Tkinter — included with standard Python on macOS and Windows; on Linux install separately (see below)
 
 ### Hardware
 
@@ -52,30 +58,68 @@ python wifi_button_builder.py
 
 ## Installation
 
-### 1. Install the ESP32 board in Arduino IDE
+### 1. Install Python
+
+**macOS**
+Python 3 is available via [python.org](https://www.python.org/downloads/) or Homebrew:
+```bash
+brew install python
+```
+
+**Windows**
+Download from [python.org](https://www.python.org/downloads/). During installation, check **Add Python to PATH**.
+
+**Linux (Ubuntu / Debian)**
+```bash
+sudo apt update
+sudo apt install python3 python3-pip python3-tk
+```
+
+**Linux (Fedora / RHEL)**
+```bash
+sudo dnf install python3 python3-pip python3-tkinter
+```
+
+**Linux (Arch)**
+```bash
+sudo pacman -S python python-pip tk
+```
+
+### 2. Clone and run the builder
+
+**macOS / Linux**
+```bash
+git clone https://github.com/dockr69/wifi-button-esphome.git
+cd wifi-button-esphome
+python wifi_button_builder.py
+```
+
+**Windows**
+```cmd
+git clone https://github.com/dockr69/wifi-button-esphome.git
+cd wifi-button-esphome
+python wifi_button_builder.py
+```
+
+### 3. Install the ESP32 board in Arduino IDE
 
 1. Open Arduino IDE → **File → Preferences**
 2. Add this URL to **Additional boards manager URLs**:
    ```
    https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
    ```
-3. Go to **Tools → Board → Boards Manager**, search for **esp32** by Espressif, and install version **3.x**
+3. Go to **Tools → Board → Boards Manager**, search for **esp32** by Espressif, install version **3.x**
 4. Select **Tools → Board → ESP32 Arduino → Adafruit Feather ESP32-C6**
 
-### 2. Required Arduino libraries
+### 4. Serial port permissions (Linux only)
 
-No additional libraries are needed. The sketch uses only:
-- `WiFi.h` (bundled with ESP32 Arduino Core)
-- `esp_sleep.h` (bundled with ESP32 Arduino Core)
-- `driver/gpio.h` (bundled with ESP32 IDF)
-
-### 3. Clone and run the builder
+On Linux the serial port requires group access. Add your user to the `dialout` group, then log out and back in:
 
 ```bash
-git clone https://github.com/dockr69/wifi-button-esphome.git
-cd wifi-button-esphome
-python wifi_button_builder.py
+sudo usermod -aG dialout $USER
 ```
+
+Verify with `ls -l /dev/ttyUSB*` or `ls -l /dev/ttyACM*` after plugging in the board.
 
 ---
 
@@ -113,7 +157,13 @@ The generated sketch enables the internal pull-up resistor on the wakeup pin, so
 
 ### 1. Start the GUI
 
+**macOS / Linux**
 ```bash
+python wifi_button_builder.py
+```
+
+**Windows**
+```cmd
 python wifi_button_builder.py
 ```
 
@@ -166,12 +216,15 @@ Click **+ Button hinzufügen** to add more actions. All configured actions are s
 
 1. Open the exported `.ino` file in Arduino IDE
 2. Select **Tools → Board → Adafruit Feather ESP32-C6**
-3. Select the correct **Port** under **Tools → Port**
-4. Click **Upload** (⌘U / Ctrl+U)
+3. Select the correct port under **Tools → Port**:
+   - **macOS:** `/dev/cu.usbmodem…` or `/dev/cu.SLAB_USBtoUART`
+   - **Windows:** `COM3`, `COM4`, etc. (check Device Manager)
+   - **Linux:** `/dev/ttyUSB0` or `/dev/ttyACM0`
+4. Click **Upload** (`Ctrl+U` / `⌘U`)
 
 > **First upload:** if the board is not detected, hold the **BOOT** button while pressing **RESET** to enter download mode, then try again.
 
-Open **Tools → Serial Monitor** at 115200 baud to watch the connection log.
+Open **Tools → Serial Monitor** at **115200 baud** to watch the connection log.
 
 ---
 
@@ -293,11 +346,15 @@ If WiFi fails, the device stays awake for `MAINTENANCE_MS` (default 5 s) before 
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---|---|
-| Board not detected in Arduino IDE | Hold BOOT + press RESET to enter download mode |
-| WiFi connect timeout | Check SSID/password; try disabling static IP; lower TX power if signal is saturated |
-| HTTP request fails | Verify the server IP and port; check firewall rules |
-| Device does not wake on button press | Ensure the wakeup pin is RTC-capable (marked ★); check wiring |
-| Deep sleep current too high | Verify IO20 is held LOW; check no other GPIO is floating |
-| Sketch compiles but immediately crashes | Select the correct board in Arduino IDE (Adafruit Feather ESP32-C6) |
+| Problem | Platform | Solution |
+|---|---|---|
+| Board not detected in Arduino IDE | All | Hold BOOT + press RESET to enter download mode |
+| No port visible in Arduino IDE | Windows | Install CP210x or CH340 USB driver for your board's USB chip |
+| No port visible in Arduino IDE | Linux | Run `sudo usermod -aG dialout $USER` and log out/in |
+| `No module named tkinter` | Linux | `sudo apt install python3-tk` (Debian/Ubuntu) or `sudo dnf install python3-tkinter` (Fedora) |
+| WiFi connect timeout | All | Check SSID/password; try disabling static IP; lower TX power if signal is saturated |
+| HTTP request fails | All | Verify the server IP and port; check firewall rules |
+| Device does not wake on button press | All | Ensure the wakeup pin is RTC-capable (marked ★); check wiring |
+| Deep sleep current too high | All | Verify IO20 is held LOW; check no other GPIO is floating |
+| Sketch compiles but immediately crashes | All | Confirm board selection is **Adafruit Feather ESP32-C6** in Arduino IDE |
+| `python` not found | Windows | Use `py` instead of `python`, or re-install Python with "Add to PATH" checked |
