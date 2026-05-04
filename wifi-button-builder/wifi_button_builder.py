@@ -16,7 +16,11 @@ DEFAULT_CONFIG = {
     "device_name": "wifi-button",
     "wifi_ssid": "",
     "wifi_password": "",
-    "use_static_ip": True,
+    # ip_mode: "static" | "dhcp" | "dhcp_cache"
+    #   static     — never use DHCP (fastest, requires fixed IP at router)
+    #   dhcp       — DHCP every wake (slowest, ~1s extra)
+    #   dhcp_cache — DHCP once, cache lease in RTC RAM, reuse on wake
+    "ip_mode": "static",
     "static_ip": "192.168.2.123",
     "gateway": "192.168.2.1",
     "subnet": "255.255.255.0",
@@ -115,7 +119,8 @@ def generate_ino(cfg: dict) -> str:
     L(f'const char* WIFI_PASSWORD = "{cfg["wifi_password"]}";')
     L()
 
-    if cfg["use_static_ip"]:
+    ip_mode = cfg.get("ip_mode", "static")
+    if ip_mode == "static":
         for name, key in [("STATIC_IP", "static_ip"), ("GATEWAY", "gateway"),
                           ("SUBNET", "subnet"), ("DNS", "dns")]:
             octets = cfg[key].split(".")
@@ -140,6 +145,13 @@ def generate_ino(cfg: dict) -> str:
     L('RTC_DATA_ATTR int savedChannel = 0;')
     L('RTC_DATA_ATTR uint8_t savedBSSID[6] = {0};')
     L('RTC_DATA_ATTR bool hasCachedWiFi = false;')
+    if ip_mode == "dhcp_cache":
+        L('// Cached DHCP lease — first wake learns it, every wake reuses it')
+        L('RTC_DATA_ATTR uint32_t cachedIP  = 0;')
+        L('RTC_DATA_ATTR uint32_t cachedGW  = 0;')
+        L('RTC_DATA_ATTR uint32_t cachedSN  = 0;')
+        L('RTC_DATA_ATTR uint32_t cachedDNS = 0;')
+        L('RTC_DATA_ATTR bool hasCachedIP = false;')
     L()
 
     L('void sendHttpRequest(const char* host, int port, const char* path, const char* method);')
@@ -166,8 +178,14 @@ def generate_ino(cfg: dict) -> str:
     L()
 
     L('  WiFi.persistent(false);')
-    if cfg["use_static_ip"]:
+    if ip_mode == "static":
         L('  WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS);')
+    elif ip_mode == "dhcp_cache":
+        L('  // Reuse cached DHCP lease (skips DHCP-DISCOVER, ~1s saved)')
+        L('  if (hasCachedIP) {')
+        L('    WiFi.config(IPAddress(cachedIP), IPAddress(cachedGW),')
+        L('                IPAddress(cachedSN), IPAddress(cachedDNS));')
+        L('  }')
 
     tx = TX_POWER_MAP.get(cfg["wifi_tx_power"], "WIFI_POWER_19_5dBm")
     L(f'  WiFi.setTxPower({tx});')
@@ -209,6 +227,15 @@ def generate_ino(cfg: dict) -> str:
     L('    savedChannel = WiFi.channel();')
     L('    memcpy(savedBSSID, WiFi.BSSID(), 6);')
     L('    hasCachedWiFi = true;')
+    if ip_mode == "dhcp_cache":
+        L('    if (!hasCachedIP) {')
+        L('      cachedIP  = (uint32_t)WiFi.localIP();')
+        L('      cachedGW  = (uint32_t)WiFi.gatewayIP();')
+        L('      cachedSN  = (uint32_t)WiFi.subnetMask();')
+        L('      cachedDNS = (uint32_t)WiFi.dnsIP();')
+        L('      hasCachedIP = true;')
+        L('      Serial.println("DHCP lease cached for next wake");')
+        L('    }')
     L()
     L('    Serial.printf("WiFi OK (%lu ms), IP: %s, CH: %d\\n",')
     L('      millis() - start, WiFi.localIP().toString().c_str(), savedChannel);')
@@ -221,6 +248,8 @@ def generate_ino(cfg: dict) -> str:
     L('    Serial.printf("WiFi FAILED after %lu ms, status: %d\\n", millis() - start, WiFi.status());')
     L('    hasCachedWiFi = false;')
     L('    savedChannel = 0;')
+    if ip_mode == "dhcp_cache":
+        L('    hasCachedIP = false;  // Invalidate lease — next wake re-DHCPs')
     L('    Serial.println("Maintenance window");')
     L('    delay(MAINTENANCE_MS);')
     L('    enterDeepSleep();')
@@ -388,18 +417,32 @@ class WifiButtonBuilder(tk.Tk):
         ttk.Entry(f, textvariable=self.pw_var, width=28, show="*").grid(row=row, column=3, sticky="w", padx=(4, 0))
 
         row += 1
-        self.static_ip_var = tk.BooleanVar(value=self.config_data["use_static_ip"])
-        ttk.Checkbutton(f, text="Statische IP", variable=self.static_ip_var).grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.ip_mode_var = tk.StringVar(value=self.config_data.get("ip_mode", "static"))
+        mode_frame = ttk.Frame(f)
+        mode_frame.grid(row=row, column=0, columnspan=8, sticky="w", pady=(4, 0))
+        ttk.Label(mode_frame, text="IP-Modus:").pack(side="left")
+        for label, val in [
+            ("Statisch",         "static"),
+            ("DHCP",             "dhcp"),
+            ("DHCP + IP-Cache",  "dhcp_cache"),
+        ]:
+            ttk.Radiobutton(mode_frame, text=label, value=val,
+                            variable=self.ip_mode_var,
+                            command=self._on_ip_mode_change).pack(side="left", padx=(8, 0))
 
         row += 1
         labels = [("IP:", "static_ip"), ("Gateway:", "gateway"), ("Subnet:", "subnet"), ("DNS:", "dns")]
         self.ip_vars = {}
+        self.ip_entries = {}
         for i, (label, key) in enumerate(labels):
             c = i * 2
             ttk.Label(f, text=label).grid(row=row, column=c, sticky="w")
             var = tk.StringVar(value=self.config_data[key])
             self.ip_vars[key] = var
-            ttk.Entry(f, textvariable=var, width=16).grid(row=row, column=c + 1, sticky="w", padx=(4, 4))
+            ent = ttk.Entry(f, textvariable=var, width=16)
+            ent.grid(row=row, column=c + 1, sticky="w", padx=(4, 4))
+            self.ip_entries[key] = ent
+        self._on_ip_mode_change()
 
         row += 1
         ttk.Label(f, text="TX Power:").grid(row=row, column=0, sticky="w", pady=(4, 0))
@@ -410,6 +453,12 @@ class WifiButtonBuilder(tk.Tk):
 
         self.power_save_var = tk.BooleanVar(value=self.config_data["wifi_power_save"])
         ttk.Checkbutton(f, text="Power Save", variable=self.power_save_var).grid(row=row, column=2, columnspan=2, sticky="w", pady=(4, 0))
+
+    def _on_ip_mode_change(self):
+        # Manual IP fields are only relevant in "static" mode
+        state = "normal" if self.ip_mode_var.get() == "static" else "disabled"
+        for ent in self.ip_entries.values():
+            ent.configure(state=state)
 
     def _build_gpio_section(self):
         f = ttk.LabelFrame(self.scroll_frame, text="GPIO (★ = RTC / Deep Sleep fähig)", padding=8)
@@ -497,7 +546,7 @@ class WifiButtonBuilder(tk.Tk):
             "device_name": self.device_name_var.get(),
             "wifi_ssid": self.ssid_var.get(),
             "wifi_password": self.pw_var.get(),
-            "use_static_ip": self.static_ip_var.get(),
+            "ip_mode": self.ip_mode_var.get(),
             "static_ip": self.ip_vars["static_ip"].get(),
             "gateway": self.ip_vars["gateway"].get(),
             "subnet": self.ip_vars["subnet"].get(),
@@ -581,10 +630,16 @@ class WifiButtonBuilder(tk.Tk):
         self.device_name_var.set(cfg.get("device_name", "wifi-button"))
         self.ssid_var.set(cfg.get("wifi_ssid", ""))
         self.pw_var.set(cfg.get("wifi_password", ""))
-        self.static_ip_var.set(cfg.get("use_static_ip", True))
+        # Migrate legacy bool → tri-state enum
+        if "ip_mode" in cfg:
+            mode = cfg["ip_mode"]
+        else:
+            mode = "static" if cfg.get("use_static_ip", True) else "dhcp"
+        self.ip_mode_var.set(mode)
         for key in ["static_ip", "gateway", "subnet", "dns"]:
             if key in self.ip_vars:
                 self.ip_vars[key].set(cfg.get(key, ""))
+        self._on_ip_mode_change()
         wakeup_gpio = cfg.get("wakeup_pin", 2)
         self.wakeup_pin_var.set(FEATHER_GPIO_LABEL.get(wakeup_gpio, f"IO{wakeup_gpio}"))
         self.wakeup_level_var.set(cfg.get("wakeup_level", "LOW"))
