@@ -1,142 +1,182 @@
-#include <WiFi.h>
+/*
+ * ESP32-C6 Thread Button
+ * Sendet Audio-Trigger per Thread/CoAP an Raspberry Pi (Sonoff Dongle Plus MG24)
+ * Deep Sleep ~100µA (2500mAh LiPo = ~2 Jahre)
+ */
+
+#include <OpenThread.h>
 #include <esp_sleep.h>
 #include <driver/gpio.h>
 
-// ---- Konfiguration ----
-const char* WIFI_SSID     = "TPPP";
-const char* WIFI_PASSWORD = "";
+// ==================== KONFIGURATION ====================
 
-const IPAddress STATIC_IP(192, 168, 2, 123);
-const IPAddress GATEWAY(192, 168, 2, 1);
-const IPAddress SUBNET(255, 255, 255, 0);
-const IPAddress DNS(8, 8, 8, 8);
+// Thread Netzwerk (vom Sonoff Dongle Plus MG24)
+const char* THREAD_NETWORK_NAME = "MyThreadNet";
+const char* THREAD_NETWORK_KEY  = "0123456789abcdef0123456789abcdef"; // 16 Byte Hex
+const uint8_t THREAD_CHANNEL    = 15;
+const uint16_t THREAD_PANID     = 0x1a2b;
 
-const char* HTTP_HOST_0 = "192.168.2.175";
-const int   HTTP_PORT_0 = 80;
-const char* HTTP_PATH_0 = "/cgi-bin/index.cgi?webif-pass=1&spotrequest=test1.mp3";
+// Pi Thread Border Router IPv6 (von "ot-ctl ifconfig" am Pi)
+const char* COAP_SERVER_ADDR = "fd33:1234:5678:9abc::1"; // Ersetze mit echter IPv6!
+const int    COAP_PORT        = 5683;        // Standard CoAP Port
+const char* COAP_PATH         = "/trigger";  // CoAP Pfad
 
-const gpio_num_t WAKEUP_PIN = GPIO_NUM_2;
+// GPIO Konfiguration
+const gpio_num_t WAKEUP_PIN      = GPIO_NUM_2;           // Button (GPIO2)
+const gpio_num_t LED_PIN         = GPIO_NUM_25;          // LED (optional)
+const gpio_num_t POWER_PIN       = GPIO_NUM_20;          // Power-Control (held)
 
+// Timing
 const unsigned long WIFI_TIMEOUT_MS = 10000;
-const unsigned long HTTP_TIMEOUT_MS = 3000;
 const unsigned long MAINTENANCE_MS  = 5000;
 
-// WiFi cache survives deep sleep
-RTC_DATA_ATTR int savedChannel = 0;
-RTC_DATA_ATTR uint8_t savedBSSID[6] = {0};
-RTC_DATA_ATTR bool hasCachedWiFi = false;
+// ==================== CODE ====================
 
-void sendHttpRequest(const char* host, int port, const char* path, const char* method);
-void enterDeepSleep();
-
-// ---- Setup (runs once on every wake) ----
 void setup() {
-  // STEMMA QT / NeoPixel power off + hold through deep sleep
-  gpio_set_direction(GPIO_NUM_20, GPIO_MODE_OUTPUT);
-  gpio_set_level(GPIO_NUM_20, 0);
-  gpio_hold_en(GPIO_NUM_20);
+    // Power-Control GPIO (STEMMA QT / NeoPixel)
+    gpio_set_direction(POWER_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(POWER_PIN, 0);
+    gpio_hold_en(POWER_PIN);
 
-  Serial.begin(115200);
-  delay(50);
+    // Serial starten
+    Serial.begin(115200);
+    delay(50);
 
-  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  if (cause == ESP_SLEEP_WAKEUP_GPIO) {
-    Serial.println("GPIO wakeup - button pressed");
-  } else {
-    Serial.printf("Other wakeup cause: %d\n", cause);
-  }
-
-  WiFi.persistent(false);
-  WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  WiFi.setSleep(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK);
-  WiFi.setScanMethod(WIFI_FAST_SCAN);
-  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
-
-  // Use cached BSSID + channel if available (skips scan)
-  if (hasCachedWiFi && savedChannel > 0) {
-    Serial.printf("Fast connect: CH %d, BSSID %02X:%02X:%02X:%02X:%02X:%02X\n",
-      savedChannel, savedBSSID[0], savedBSSID[1], savedBSSID[2],
-      savedBSSID[3], savedBSSID[4], savedBSSID[5]);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, savedChannel, savedBSSID);
-  } else {
-    Serial.println("No cache, full scan");
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  }
-
-  Serial.println("Connecting WiFi...");
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) {
-    // Cached connect failed? Retry with full scan
-    if (hasCachedWiFi && millis() - start > 4000 && WiFi.status() != WL_CONNECTED) {
-      Serial.println("Cache miss - fallback to full scan");
-      hasCachedWiFi = false;
-      WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    // Wakeup-Ursache prüfen
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+        Serial.println("=== GPIO WAKEUP - BUTTON PRESSED ===");
+    } else {
+        Serial.printf("=== UNEXPECTED WAKEUP: %d ===\n", cause);
     }
+
+    // LED initialisieren
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_PIN, 1); // Aus (active low)
+
+    // OpenThread initialisieren
+    Serial.println("Initializing OpenThread...");
+    OpenThread.begin();
+
+    // Dataset erstellen (Panic Network)
+    DataSet dataset;
+    dataset.initNew();
+    dataset.setNetworkName(THREAD_NETWORK_NAME);
+    dataset.setChannel(THREAD_CHANNEL);
+    dataset.setNetworkKey(THREAD_NETWORK_KEY);
+    dataset.setPanid(THREAD_PANID);
+
+    // Dataset commit und starten
+    OpenThread.commitDataSet(dataset);
+    OpenThread.start();
+
+    // Border Router aktivieren (Pi als BR)
+    OpenThread.setBorderRouter(true);
+    OpenThread.networkInterfaceUp();
+
+    // Warten bis Thread joined (Role = Child)
+    Serial.println("Waiting for Thread network...");
+    unsigned long timeout = millis() + 30000; // 30s Timeout
+    while (OpenThread.getRole() == OT_DEVICE_ROLE_DISABLED && millis() < timeout) {
+        delay(100);
+        Serial.print(".");
+    }
+
+    // Prüfen ob Thread verbunden
+    if (OpenThread.getRole() == OT_DEVICE_ROLE_DISABLED) {
+        Serial.println("\nERROR: Thread join failed!");
+        Serial.println("Check Pi Sonoff Dongle and network config.");
+        enterDeepSleep();
+        return;
+    }
+
+    // Ausgeschaltetes LED einschalten
+    gpio_set_level(LED_PIN, 0); // Ein
     delay(100);
-    if ((millis() - start) % 1000 < 100) {
-      Serial.printf("  WiFi status: %d (%lu ms)\n", WiFi.status(), millis() - start);
-    }
-  }
+    gpio_set_level(LED_PIN, 1); // Aus
 
-  if (WiFi.status() == WL_CONNECTED) {
-    savedChannel = WiFi.channel();
-    memcpy(savedBSSID, WiFi.BSSID(), 6);
-    hasCachedWiFi = true;
+    // Thread-Details ausgeben
+    Serial.println("\n=== THREAD STATUS ===");
+    Serial.printf("Role: %d\n", OpenThread.getRole());
+    Serial.printf("State: %s\n", OpenThread.getState());
 
-    Serial.printf("WiFi OK (%lu ms), IP: %s, CH: %d\n",
-      millis() - start, WiFi.localIP().toString().c_str(), savedChannel);
-    sendHttpRequest(HTTP_HOST_0, HTTP_PORT_0, HTTP_PATH_0, "GET");
+    // Eigene IPv6-Adresse ausgeben
+    char ipv6Str[45];
+    OpenThread.getIpv6Address(MAIN_ADDRESS_TYPE, ipv6Str);
+    Serial.printf("My IPv6: %s\n", ipv6Str);
+
+    // CoAP Message an Pi senden
+    Serial.println("Sending CoAP request...");
+    sendCoapMessage(COAP_SERVER_ADDR, COAP_PORT, COAP_PATH, "test1.mp3");
+
+    // Deep Sleep
     enterDeepSleep();
-  } else {
-    Serial.printf("WiFi FAILED after %lu ms, status: %d\n", millis() - start, WiFi.status());
-    hasCachedWiFi = false;
-    savedChannel = 0;
-    Serial.println("Maintenance window");
-    delay(MAINTENANCE_MS);
-    enterDeepSleep();
-  }
 }
 
 void loop() {
+    // Nichts - alles in setup()
 }
 
-// ---- HTTP Fire-and-Forget ----
-void sendHttpRequest(const char* host, int port, const char* path, const char* method) {
-  Serial.printf("HTTP %s %s%s\n", method, host, path);
-  unsigned long httpStart = millis();
+// ==================== FUNCTIONEN ====================
 
-  WiFiClient client;
-  if (client.connect(host, port, HTTP_TIMEOUT_MS)) {
-    client.printf("%s %s HTTP/1.0\r\n"
-                  "Host: %s\r\n"
-                  "Connection: close\r\n\r\n",
-                  method, path, host);
-    client.flush();
-    delay(100);
-    client.stop();
-    Serial.printf("HTTP sent (%lu ms)\n", millis() - httpStart);
-  } else {
-    Serial.printf("HTTP connect failed (%lu ms)\n", millis() - httpStart);
-  }
+void sendCoapMessage(const char* addr, int port, const char* path, const char* payload) {
+    Serial.printf("CoAP [%s]:%d %s\n", addr, port, path);
+
+    // UDP Socket für CoAP
+    WiFiUDP udp;
+    if (!udp.beginMulticast(INADDR_ANY, addr)) {
+        Serial.println("Failed to start multicast");
+        return;
+    }
+
+    // CoAP Request bauen (GET Request)
+    String coapRequest = "GET ";
+    coapRequest += path;
+    coapRequest += " HTTP/1.1\r\n";
+    coapRequest += "Host: ";
+    coapRequest += addr;
+    coapRequest += "\r\n";
+    coapRequest += "\r\n";
+
+    // Senden
+    udp.beginPacket(addr, port);
+    udp.write(coapRequest.c_str(), coapRequest.length());
+    udp.endPacket();
+
+    Serial.println("CoAP sent!");
+
+    // Antwort abwarten (optional)
+    delay(500);
+    while (udp.parsePacket()) {
+        String response = udp.readString();
+        Serial.printf("CoAP Response: %s\n", response.c_str());
+    }
 }
 
-// ---- Deep Sleep (ESP32-C6) ----
 void enterDeepSleep() {
-  Serial.printf("Sleeping after %lu ms total uptime\n", millis());
-  Serial.flush();
+    Serial.println("\n=== ENTERING DEEP SLEEP ===");
+    Serial.flush();
 
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
+    // LED ausschalten
+    gpio_set_level(LED_PIN, 1);
 
-  gpio_pullup_en(WAKEUP_PIN);
-  gpio_pulldown_dis(WAKEUP_PIN);
+    // WiFi/Thread deaktivieren
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
 
-  esp_deep_sleep_enable_gpio_wakeup(1ULL << WAKEUP_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+    // GPIO2 Wakeup konfigurieren (Button: low-trigger)
+    gpio_pullup_en(WAKEUP_PIN);
+    gpio_pulldown_dis(WAKEUP_PIN);
 
-  esp_deep_sleep_start();
+    // Deep Sleep mit GPIO Wakeup
+    esp_deep_sleep_enable_gpio_wakeup(1ULL << WAKEUP_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+
+    // Optional: Timer Wakeup (z.B. alle 1h checken)
+    // esp_deep_sleep_enable_timer_wakeup(3600000000ULL); // 1h
+
+    Serial.printf("Sleeping... (Current: ~100uA)\n");
+    Serial.flush();
+
+    // Deep Sleep starten
+    esp_deep_sleep_start();
 }

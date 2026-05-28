@@ -1,0 +1,329 @@
+ESP32-C6 Thread-Beispiel mit Raspberry Pi Border Router
+========================================================
+
+ZIEL:
+- ESP32-C6 Feather als Thread-Endgerät (Endgerät)
+- Raspberry Pi mit Thread-Module als Border Router
+- ESP32 sendet CoAP-Message an Pi
+- Pi wandelt CoAP in HTTP-Request um (an 192.168.2.120)
+- Deep Sleep bleibt erhalten
+
+ARCHITEKTUR:
+┌─────────────────┐         Thread (IPv6)         ┌──────────────────┐
+│  ESP32-C6      │◄────── CoAP UDP (IPv6) ───────►│  Pi mit Thread   │
+│  (Endgerät)    │                                 │  Border Router   │
+│  - Deep Sleep  │                                 │                  │
+│  - Button GPIO │                                 │  - CoAP Server   │
+│  - Thread Node │                                 │  - HTTP Client   │
+└─────────────────┘                                 └────────┬─────────┘
+                                                           │
+                                                           │ HTTP GET
+                                                           ▼
+                                                  ┌──────────────────┐
+                                                  │ 192.168.2.120    │
+                                                  │ (ESP32 mit WebUI)│
+                                                  └──────────────────┘
+
+
+CODE-STRUKTUR (wifi-button-thread.ino):
+========================================
+
+#include <OpenThread.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
+
+// Konfiguration
+const char* THREAD_NETWORK_NAME = "MyThreadNet";
+const char* THREAD_NETWORK_KEY  = "0123456789abcdef0123456789abcdef"; // 16 Byte Hex
+const uint8_t THREAD_CHANNEL    = 15;
+
+const gpio_num_t WAKEUP_PIN = GPIO_NUM_2;
+
+// Pi Border Router IPv6 Adresse (CoAP Endpoint)
+// Format: udp://[fd00::1]:5683 oder ähnlich
+const char* COAP_SERVER_ADDR = "fd00::1";  // Pi Thread-Interface IPv6
+const int    COAP_PORT       = 5683;        // Standard CoAP Port
+const char* COAP_PATH        = "/trigger";  // CoAP Pfad
+
+// HTTP Ziel am Pi
+const char* HTTP_TARGET_IP   = "192.168.2.120";
+const char* HTTP_PATH        = "/cgi-bin/index.cgi?webif-pass=1&spotrequest=test1.mp3";
+
+// Thread-Beispiel Code
+void setup() {
+    Serial.begin(115200);
+
+    // GPIO20 Power-Control (wie im WiFi-Code)
+    gpio_set_direction(GPIO_NUM_20, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_20, 0);
+    gpio_hold_en(GPIO_NUM_20);
+
+    // Wakeup-Ursache prüfen
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+        Serial.println("GPIO wakeup - button pressed");
+    }
+
+    // OpenThread initialisieren
+    OpenThread.begin();
+
+    // Dataset erstellen (Panic Network - ohne Border Router)
+    // Alternativ: Border Router Dataset importieren
+    DataSet dataset;
+    dataset.initNew();
+    dataset.setNetworkName(THREAD_NETWORK_NAME);
+    dataset.setChannel(THREAD_CHANNEL);
+    dataset.setNetworkKey(THREAD_NETWORK_KEY);
+
+    // Dataset commit und starten
+    OpenThread.commitDataSet(dataset);
+    OpenThread.start();
+
+    // Border Router aktivieren (nur wenn Pi als BR dient)
+    OpenThread.setBorderRouter(true);
+    OpenThread.networkInterfaceUp();
+
+    // Warten bis Thread joined (Role = Child)
+    Serial.println("Waiting for Thread network...");
+    unsigned long timeout = millis() + 30000; // 30s Timeout
+    while (OpenThread.getRole() == OT_DEVICE_ROLE_DISABLED && millis() < timeout) {
+        delay(100);
+    }
+
+    if (OpenThread.getRole() == OT_DEVICE_ROLE_DISABLED) {
+        Serial.println("ERROR: Thread join failed");
+        enterDeepSleep();
+        return;
+    }
+
+    Serial.printf("Thread joined! Role: %d, IPv6: ", OpenThread.getRole());
+
+    // Eigene IPv6-Adresse ausgeben
+    char ipv6Str[45];
+    OpenThread.getIpv6Address(MAIN_ADDRESS_TYPE, ipv6Str);
+    Serial.println(ipv6Str);
+
+    // CoAP Message an Pi senden
+    sendCoapMessage(COAP_SERVER_ADDR, COAP_PORT, COAP_PATH, "test1.mp3");
+
+    // Deep Sleep
+    enterDeepSleep();
+}
+
+void loop() {
+    // Nichts - alles in setup()
+}
+
+void sendCoapMessage(const char* addr, int port, const char* path, const char* payload) {
+    Serial.printf("Sending CoAP to [%s]:%d %s\n", addr, port, path);
+
+    // UDP Socket für CoAP
+    WiFiUDP udp;
+    if (!udp.beginMulticast(INADDR_ANY, addr)) {
+        Serial.println("Failed to start multicast");
+        return;
+    }
+
+    // CoAP Request bauen (GET oder POST)
+    String coapRequest = "GET " + String(path) + " HTTP/1.1\r\n";
+    coapRequest += "Host: " + String(addr) + "\r\n";
+    coapRequest += "\r\n";
+
+    // Senden
+    udp.beginPacket(addr, port);
+    udp.write(coapRequest.c_str(), coapRequest.length());
+    udp.endPacket();
+
+    Serial.println("CoAP sent!");
+
+    // Antwort abwarten (optional)
+    delay(500);
+    while (udp.parsePacket()) {
+        String response = udp.readString();
+        Serial.printf("CoAP Response: %s\n", response.c_str());
+    }
+}
+
+void enterDeepSleep() {
+    Serial.println("Entering deep sleep...");
+    Serial.flush();
+
+    // WiFi/Thread deaktivieren
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+
+    // GPIO2 Wakeup konfigurieren
+    gpio_pullup_en(WAKEUP_PIN);
+    gpio_pulldown_dis(WAKEUP_PIN);
+
+    // Deep Sleep mit GPIO Wakeup
+    esp_deep_sleep_enable_gpio_wakeup(1ULL << WAKEUP_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+
+    // Deep Sleep starten (~100µA)
+    esp_deep_sleep_start();
+}
+
+
+PI SEITENCODE (Python Skript am Raspberry Pi):
+==============================================
+
+#!/usr/bin/env python3
+# thread_coap_server.py
+# Läuft auf dem Raspberry Pi mit Thread-Module
+
+import socket
+import requests
+from threading import Thread
+
+# Thread-Interface (z.B. rcp0 oder br0)
+THREAD_IFACE = "cp0"  # oder "br0" je nach Einrichtung
+THREAD_IPV6 = "fd00::1"  # Pi Thread-Interface IPv6
+COAP_PORT = 5683
+
+# HTTP Ziel (ESP32 mit WebUI)
+HTTP_TARGET = "http://192.168.2.120/cgi-bin/index.cgi"
+
+def handle_coap_request(addr, message):
+    """CoAP Request empfangen und in HTTP umwandeln"""
+    print(f"CoAP received from {addr}: {message}")
+
+    # Payload extrahieren (Audio-Dateiname)
+    audio_file = message.strip()
+
+    # HTTP Request an ESP32 senden
+    http_url = f"{HTTP_TARGET}?webif-pass=1&spotrequest={audio_file}"
+    try:
+        response = requests.get(http_url, timeout=5)
+        print(f"HTTP response: {response.status_code}")
+    except Exception as e:
+        print(f"HTTP failed: {e}")
+
+def coap_listener():
+    """UDP Listener für CoAP Messages"""
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    sock.bind(('::', COAP_PORT))
+    sock.settimeout(1)
+
+    print(f"CoAP server listening on [::]:{COAP_PORT}")
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(1024)
+            Thread(target=handle_coap_request, args=(addr, data.decode())).start()
+        except socket.timeout:
+            continue
+        except KeyboardInterrupt:
+            break
+
+if __name__ == "__main__":
+    coap_listener()
+
+
+KONFIGURATION MIT SONOFF DONGLE PLUS MG24:
+==========================================
+
+Der Sonoff Dongle Plus MG24 kann SOWOHL Zigbee ALS AUCH Thread gleichzeitig (MultiPAN RCP).
+
+OPTION A: Home Assistant mit Zigbee2MQTT + OpenThread Border Router
+---------------------------------------------------------------------
+1. Zigbee2MQTT Add-on installieren
+2. OpenThread Border Router Add-on installieren
+3. Sonoff Dongle als USB-Gerät einbinden (/dev/serial/by-id/usb-SONOFF_Dongle_Plus_MG24_XXXX-if00)
+
+openthread_border_router.yaml (HA Configuration):
+```yaml
+openthread:
+  device:
+    path: /dev/serial/by-id/usb-SONOFF_Dongle_Plus_MG24_XXXX-if00
+    baudrate: 115200
+    config:
+      router_migration: disabled
+      netdata_init_new: true
+      netdata_panid: 0x1a2b
+      netdata_channel: 15
+      netdata_extpanid: [0xda, 0xb7, 0x65, 0x43, 0x21, 0x09, 0x8f, 0xed]
+      netdata_networkkey: 0123456789abcdef0123456789abcdef
+```
+
+OPTION B: Zigbee2MQTT mit MultiPAN Firmware
+---------------------------------------------
+Sonoff Dongle mit MultiPAN RCP flashen:
+https://dongle.sonoff.tech/sonoff-dongle-flasher/
+
+Zigbee2MQTT config:
+```yaml
+serial:
+  port: /dev/serial/by-id/usb-SONOFF_Dongle_Plus_MG24_XXXX-if00
+  adapter: ember
+  baudrate: 115200
+  rcp:
+    type: mg24
+    config:
+      router_migration: disabled
+      netdata_init_new: true
+      netdata_panid: 0x1a2b
+      netdata_channel: 15
+      netdata_extpanid: [0xda, 0xb7, 0x65, 0x43, 0x21, 0x09, 0x8f, 0xed]
+      netdata_networkkey: 0123456789abcdef0123456789abcdef
+```
+
+THREAD NETWORK KEY GENERIEREN (OTA):
+-------------------------------------
+Im HA Terminal (SSH Add-on oder Zigbee2MQTT Console):
+```bash
+ot-ctl
+> dataset init new
+> dataset set networkkey 0123456789abcdef0123456789abcdef
+> dataset set panid 0x1a2b
+> dataset set channel 15
+> dataset set extpanid dad765432109fed
+> commit active
+> ifconfig up
+> netif up
+> state
+```
+
+THREAD IPv6 ADRESSE DES PI FINDEN:
+-----------------------------------
+```bash
+# Thread Interface finden
+ifconfig | grep -A 10 thread
+
+# Oder
+ot-ctl ifconfig
+```
+
+Suche nach Adresse wie `fd33:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx`
+
+CODE ANPASSUNG FÜR SONOFF DONGLE:
+---------------------------------
+# Im ESP32 Code:
+const char* THREAD_NETWORK_KEY = "0123456789abcdef0123456789abcdef";
+const uint8_t THREAD_CHANNEL     = 15;
+const uint16_t THREAD_PANID      = 0x1a2b;
+
+const char* COAP_SERVER_ADDR = "fd33:xxxx:xxxx:xxxx::1";   # Pi Thread IPv6 (von ifconfig)
+const int    COAP_PORT         = 5683;
+const char* COAP_PATH          = "/trigger";
+
+
+STROMVERBRAUCH:
+==============
+- ESP32-C6 Deep Sleep: ~100µA (wie vorher)
+- Thread-Modul am Pi: ~50-100mA (läuft permanent)
+- Total: Nur ESP32-C6 zählt für Batteriebetrieb
+
+
+VORTEILE GEGENÜBER WIF
+=====================
+✓ Thread ist zuverlässiger (Mesh, weniger Ausfälle)
+✓ Geringere Latenz als WiFi-Scan
+✓ Matter-ready (Zukunftssicher)
+✓ Deep Sleep bleibt erhalten
+✓ Keine WiFi-Interferenzen
+
+NACHTEILE:
+==========
+- Thread Border Router benötigt
+- Komplexere Initialkonfiguration
+- IPv6-Netzwerkverständnis nötig
