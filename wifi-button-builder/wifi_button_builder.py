@@ -38,6 +38,9 @@ DEFAULT_CONFIG = {
     "dns": "8.8.8.8",
     "wifi_timeout_s": 10,
     "http_timeout_s": 3,
+    # Anti-spam cooldown: ignore presses within N seconds of last send.
+    # 0 disables. Survives deep sleep via RTC timekeeping.
+    "cooldown_s": 30,
     "wifi_tx_power": "20dBm",
     "wifi_power_save": False,
     # Send the whole batch repeat_count times, with repeat_interval_s between sends.
@@ -257,6 +260,7 @@ def generate_ino(cfg: dict) -> str:
     L('#include <WiFi.h>')
     L('#include <esp_sleep.h>')
     L('#include <driver/gpio.h>')
+    L('#include <sys/time.h>')
     L()
 
     L('// ---- Konfiguration ----')
@@ -287,6 +291,7 @@ def generate_ino(cfg: dict) -> str:
     L(f'const unsigned long MAINTENANCE_HOLD_MS = {MAINTENANCE_HOLD_MS};')
     L(f'const int           REPEAT_COUNT       = {cfg.get("repeat_count", 1)};')
     L(f'const unsigned long REPEAT_INTERVAL_MS = {cfg.get("repeat_interval_s", 60) * 1000};')
+    L(f'const uint64_t      COOLDOWN_US        = {cfg.get("cooldown_s", 0)}ULL * 1000000ULL;  // 0 = disabled')
     L()
 
     L('// WiFi cache survives deep sleep')
@@ -295,6 +300,8 @@ def generate_ino(cfg: dict) -> str:
     L('RTC_DATA_ATTR bool hasCachedWiFi = false;')
     L('// Repeat sequence counter (incremented across timer-wake cycles)')
     L('RTC_DATA_ATTR int repeatIndex = 0;')
+    L('// Wall-clock (gettimeofday) of last sequence start — survives deep sleep via RTC')
+    L('RTC_DATA_ATTR uint64_t lastSendUs = 0;')
     if ip_mode == "dhcp_cache":
         L('// Cached DHCP lease — first wake learns it, every wake reuses it')
         L('RTC_DATA_ATTR uint32_t cachedIP  = 0;')
@@ -345,6 +352,19 @@ def generate_ino(cfg: dict) -> str:
     L('      while (gpio_get_level(WAKEUP_PIN) == 0 && millis() - relStart < 30000) { delay(50); }')
     L('      delay(MAINTENANCE_MS);')
     L('      enterDeepSleep();  // does not return')
+    L('    }')
+    L()
+    L('    // Cooldown: ignore short presses within COOLDOWN_US of last send.')
+    L('    // Checked after maintenance so long-press reflashing always works.')
+    L('    if (COOLDOWN_US > 0 && lastSendUs > 0) {')
+    L('      struct timeval tv;')
+    L('      gettimeofday(&tv, NULL);')
+    L('      uint64_t nowUs = (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;')
+    L('      if (nowUs > lastSendUs && (nowUs - lastSendUs) < COOLDOWN_US) {')
+    L('        uint64_t remainMs = (COOLDOWN_US - (nowUs - lastSendUs)) / 1000;')
+    L('        Serial.printf("Cooldown active - %llu ms remaining, ignoring press\\n", remainMs);')
+    L('        enterDeepSleep();  // does not return')
+    L('      }')
     L('    }')
     L('  } else if (cause == ESP_SLEEP_WAKEUP_TIMER) {')
     L('    Serial.printf("Timer wakeup - repeat %d/%d\\n", repeatIndex + 1, REPEAT_COUNT);')
@@ -418,6 +438,13 @@ def generate_ino(cfg: dict) -> str:
     L()
     L('    Serial.printf("WiFi OK (%lu ms), IP: %s, CH: %d\\n",')
     L('      millis() - start, WiFi.localIP().toString().c_str(), savedChannel);')
+    L()
+    L('    // Stamp cooldown timer at first send of a sequence (not on repeats)')
+    L('    if (repeatIndex == 0) {')
+    L('      struct timeval tv;')
+    L('      gettimeofday(&tv, NULL);')
+    L('      lastSendUs = (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;')
+    L('    }')
 
     for i, pu in enumerate(parsed_urls):
         L(f'    sendHttpRequest(HTTP_HOST_{i}, HTTP_PORT_{i}, HTTP_PATH_{i}, "{pu["method"]}");')
@@ -688,6 +715,7 @@ class WifiButtonBuilder(tk.Tk):
         items = [
             ("WiFi Timeout:", "wifi_timeout_s", 1, 120),
             ("HTTP Timeout:", "http_timeout_s", 1, 120),
+            ("Cooldown:",     "cooldown_s",    0, 3600),
         ]
         for i, (label, key, lo, hi) in enumerate(items):
             ttk.Label(f, text=label).grid(row=0, column=i * 2, sticky="w")
@@ -698,6 +726,8 @@ class WifiButtonBuilder(tk.Tk):
             )
         ttk.Label(f, text="Maintenance: Taste 5 s halten → bleibt 5 s wach zum Reflashen (fest).",
                   foreground="gray").grid(row=1, column=0, columnspan=8, sticky="w", pady=(4, 0))
+        ttk.Label(f, text="Cooldown: kurze Tastendrücke innerhalb dieser Zeit nach dem letzten Send werden ignoriert (0 = aus). Langer Druck → Maintenance bleibt immer aktiv.",
+                  foreground="gray", wraplength=820).grid(row=2, column=0, columnspan=8, sticky="w", pady=(2, 0))
 
     def _build_repeat_section(self):
         f = ttk.LabelFrame(self.scroll_frame,
@@ -807,6 +837,7 @@ class WifiButtonBuilder(tk.Tk):
             "dns": self.ip_vars["dns"].get(),
             "wifi_timeout_s": self.timing_vars["wifi_timeout_s"].get(),
             "http_timeout_s": self.timing_vars["http_timeout_s"].get(),
+            "cooldown_s": self.timing_vars["cooldown_s"].get(),
             "wifi_tx_power": self.tx_power_var.get(),
             "wifi_power_save": self.power_save_var.get(),
             "repeat_count": self.repeat_count_var.get(),
@@ -924,6 +955,7 @@ class WifiButtonBuilder(tk.Tk):
         timing_defaults = {
             "wifi_timeout_s": 10,
             "http_timeout_s": 3,
+            "cooldown_s":     30,
         }
         for key_s, default_s in timing_defaults.items():
             if key_s in self.timing_vars:
