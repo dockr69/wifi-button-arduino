@@ -1051,7 +1051,7 @@ class WifiButtonBuilder(tk.Tk):
 
         ttk.Label(f, text="  Passwort:").grid(row=row, column=2, sticky="w")
         self.pw_var = tk.StringVar(value=self.config_data["wifi_password"])
-        ttk.Entry(f, textvariable=self.pw_var, width=28, show="*").grid(row=row, column=3, sticky="w", padx=(4, 0))
+        ttk.Entry(f, textvariable=self.pw_var, width=28).grid(row=row, column=3, sticky="w", padx=(4, 0))
 
         row += 1
         self.ip_mode_var = tk.StringVar(value=self.config_data.get("ip_mode", "static"))
