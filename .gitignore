@@ -8,3 +8,8 @@ venv/
 
 # ESPHome secrets
 secrets.yaml
+
+# Local fallback device DB (created only if the private ptouch repo isn't
+# checked out beside this one). Contains WiFi passwords in plaintext — never
+# commit it to this public repo. The real DB lives in the private ptouch repo.
+buttons.db

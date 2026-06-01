@@ -7,11 +7,13 @@ Hardcoded for Adafruit Feather ESP32-C6.
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import csv
 import json
 import os
 import re
 import ipaddress
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -20,12 +22,20 @@ import threading
 import queue
 import urllib.request
 import zipfile
+from datetime import datetime
 from pathlib import Path
+
+# ESP32-C6 (USB-Serial-JTAG) puts the base MAC into the USB descriptor
+# serial number, so we can read it without any firmware running.
+MAC_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
     "device_name": "wifi-button",
+    # Installation site — ESP32s are deployed per location. Drives DB sorting.
+    "customer": "",
+    "location": "",
     "wifi_ssid": "",
     "wifi_password": "",
     # ip_mode: "static" | "dhcp_cache"
@@ -79,6 +89,247 @@ FQBN = "esp32:esp32:adafruit_feather_esp32c6"
 # before the chip drops back into deep sleep.
 MAINTENANCE_HOLD_MS = 5000
 MAINTENANCE_MS = 60000
+
+# ── Shared device DB (ptouch/labels.db) ────────────────────────────────────────
+#
+# The ptouch label tool keeps a git-synced SQLite DB (labels.db) keyed by the
+# device MAC. We reuse that exact file so a flashed button's full config (IP,
+# WiFi, HTTP actions …) lives next to its printed-label record and PTouch can
+# show everything. The ptouch repo is private, so storing the WiFi password in
+# plaintext is acceptable. If the ptouch repo isn't checked out beside us, we
+# fall back to a local buttons.db (no git sync).
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PTOUCH_DIR = Path(os.environ.get(
+    "WIFI_BUTTON_PTOUCH_DIR",
+    str(SCRIPT_DIR.parent.parent / "ptouch"),
+))
+if PTOUCH_DIR.is_dir():
+    DB_PATH = PTOUCH_DIR / "labels.db"
+    DB_GIT_DIR: Path | None = PTOUCH_DIR
+else:
+    DB_PATH = SCRIPT_DIR / "buttons.db"
+    DB_GIT_DIR = None
+
+WB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wifi_buttons (
+    mac           TEXT PRIMARY KEY,
+    customer      TEXT,
+    location      TEXT,
+    device_name   TEXT,
+    ip_mode       TEXT,
+    ip            TEXT,
+    gateway       TEXT,
+    subnet        TEXT,
+    dns           TEXT,
+    wifi_ssid     TEXT,
+    wifi_password TEXT,
+    buttons       TEXT,
+    config_json   TEXT,
+    ino           TEXT,
+    first_seen    TEXT,
+    last_flashed  TEXT,
+    flash_count   INTEGER NOT NULL DEFAULT 0,
+    notes         TEXT
+);
+"""
+
+
+def wb_db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH)
+    con.executescript(WB_SCHEMA)
+    # Migration for DBs created before a column existed.
+    have = [r[1] for r in con.execute("PRAGMA table_info(wifi_buttons)").fetchall()]
+    for col in ("ino", "customer", "location"):
+        if col not in have:
+            con.execute(f"ALTER TABLE wifi_buttons ADD COLUMN {col} TEXT")
+    con.commit()
+    return con
+
+
+def wb_register(mac: str, cfg: dict, ino: str = "") -> None:
+    """Insert or update a device's full config (+ generated .ino), keyed by MAC."""
+    mac = mac.upper()
+    now = datetime.now().isoformat(timespec="seconds")
+    ip = cfg.get("static_ip", "") if cfg.get("ip_mode") == "static" else "DHCP"
+    buttons = json.dumps(cfg.get("buttons", []), ensure_ascii=False)
+    config_json = json.dumps(cfg, ensure_ascii=False)
+    con = wb_db()
+    con.execute(
+        """
+        INSERT INTO wifi_buttons
+            (mac, customer, location, device_name, ip_mode, ip, gateway,
+             subnet, dns, wifi_ssid, wifi_password, buttons, config_json, ino,
+             first_seen, last_flashed, flash_count, notes)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'')
+        ON CONFLICT(mac) DO UPDATE SET
+            customer      = excluded.customer,
+            location      = excluded.location,
+            device_name   = excluded.device_name,
+            ip_mode       = excluded.ip_mode,
+            ip            = excluded.ip,
+            gateway       = excluded.gateway,
+            subnet        = excluded.subnet,
+            dns           = excluded.dns,
+            wifi_ssid     = excluded.wifi_ssid,
+            wifi_password = excluded.wifi_password,
+            buttons       = excluded.buttons,
+            config_json   = excluded.config_json,
+            ino           = excluded.ino,
+            last_flashed  = excluded.last_flashed,
+            flash_count   = wifi_buttons.flash_count + 1
+        """,
+        (mac, cfg.get("customer", ""), cfg.get("location", ""),
+         cfg.get("device_name", ""), cfg.get("ip_mode", ""), ip,
+         cfg.get("gateway", ""), cfg.get("subnet", ""), cfg.get("dns", ""),
+         cfg.get("wifi_ssid", ""), cfg.get("wifi_password", ""),
+         buttons, config_json, ino, now, now),
+    )
+    con.commit()
+    con.close()
+
+
+def _wb_rows(where: str = "", params: tuple = ()) -> list[tuple]:
+    con = wb_db()
+    rows = con.execute(
+        "SELECT COALESCE(customer,''), COALESCE(location,''), mac, "
+        "device_name, ip, wifi_ssid, buttons, "
+        "COALESCE(last_flashed,'—'), flash_count, COALESCE(notes,'') "
+        f"FROM wifi_buttons {where} "
+        "ORDER BY customer COLLATE NOCASE, location COLLATE NOCASE, "
+        "device_name COLLATE NOCASE",
+        params,
+    ).fetchall()
+    con.close()
+    return rows
+
+
+def wb_all() -> list[tuple]:
+    return _wb_rows()
+
+
+def wb_search(query: str) -> list[tuple]:
+    like = f"%{query}%"
+    return _wb_rows(
+        "WHERE customer LIKE ? OR location LIKE ? OR mac LIKE ? "
+        "OR device_name LIKE ? OR ip LIKE ? OR wifi_ssid LIKE ? "
+        "OR buttons LIKE ? OR COALESCE(notes,'') LIKE ?",
+        (like, like, like, like, like, like, like, like),
+    )
+
+
+WB_EXPORT_COLS = ("customer", "location", "mac", "device_name", "ip_mode",
+                  "ip", "gateway", "subnet", "dns", "wifi_ssid",
+                  "wifi_password", "buttons", "first_seen", "last_flashed",
+                  "flash_count", "notes", "config_json")
+
+
+def wb_export_rows(query: str = "") -> list[tuple]:
+    """Full per-device rows for CSV export (everything that's configurable)."""
+    select = (
+        "SELECT COALESCE(customer,''), COALESCE(location,''), mac, "
+        "COALESCE(device_name,''), COALESCE(ip_mode,''), COALESCE(ip,''), "
+        "COALESCE(gateway,''), COALESCE(subnet,''), COALESCE(dns,''), "
+        "COALESCE(wifi_ssid,''), COALESCE(wifi_password,''), "
+        "COALESCE(buttons,''), COALESCE(first_seen,''), "
+        "COALESCE(last_flashed,''), COALESCE(flash_count,0), "
+        "COALESCE(notes,''), COALESCE(config_json,'') FROM wifi_buttons "
+    )
+    order = (" ORDER BY customer COLLATE NOCASE, location COLLATE NOCASE, "
+             "device_name COLLATE NOCASE")
+    con = wb_db()
+    if query:
+        like = f"%{query}%"
+        rows = con.execute(
+            select +
+            "WHERE customer LIKE ? OR location LIKE ? OR mac LIKE ? "
+            "OR device_name LIKE ? OR ip LIKE ? OR wifi_ssid LIKE ? "
+            "OR buttons LIKE ? OR COALESCE(notes,'') LIKE ?" + order,
+            (like, like, like, like, like, like, like, like),
+        ).fetchall()
+    else:
+        rows = con.execute(select + order).fetchall()
+    con.close()
+    return rows
+
+
+def wb_get_config(mac: str) -> dict | None:
+    con = wb_db()
+    row = con.execute(
+        "SELECT config_json FROM wifi_buttons WHERE mac=?", (mac,)
+    ).fetchone()
+    con.close()
+    return json.loads(row[0]) if row and row[0] else None
+
+
+def wb_get_ino(mac: str) -> str:
+    con = wb_db()
+    row = con.execute(
+        "SELECT ino FROM wifi_buttons WHERE mac=?", (mac,)
+    ).fetchone()
+    con.close()
+    return (row[0] or "") if row else ""
+
+
+def wb_delete(mac: str) -> None:
+    con = wb_db()
+    con.execute("DELETE FROM wifi_buttons WHERE mac=?", (mac,))
+    con.commit()
+    con.close()
+
+
+def wb_set_notes(mac: str, notes: str) -> None:
+    con = wb_db()
+    con.execute("UPDATE wifi_buttons SET notes=? WHERE mac=?", (notes, mac))
+    con.commit()
+    con.close()
+
+
+def wb_git_pull() -> None:
+    """Pull the latest DB from the ptouch remote (silent, non-fatal)."""
+    if DB_GIT_DIR is None:
+        return
+    try:
+        subprocess.run(
+            ["git", "-C", str(DB_GIT_DIR), "pull", "--rebase",
+             "--autostash", "--quiet"],
+            check=False, timeout=15, capture_output=True)
+    except Exception:
+        pass
+
+
+def wb_git_push(message: str) -> None:
+    """Commit + push the DB (async, fire-and-forget) via the ptouch repo."""
+    if DB_GIT_DIR is None:
+        return
+
+    def _run():
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(DB_GIT_DIR), "add", str(DB_PATH)],
+                capture_output=True, timeout=10)
+            if r.returncode != 0:
+                return
+            r = subprocess.run(
+                ["git", "-C", str(DB_GIT_DIR), "diff", "--cached", "--quiet"],
+                capture_output=True)
+            if r.returncode == 0:
+                return  # nothing staged
+            subprocess.run(
+                ["git", "-C", str(DB_GIT_DIR), "commit", "-m", message],
+                capture_output=True, timeout=10)
+            subprocess.run(
+                ["git", "-C", str(DB_GIT_DIR), "pull", "--rebase",
+                 "--autostash", "--quiet"],
+                capture_output=True, timeout=15)
+            subprocess.run(
+                ["git", "-C", str(DB_GIT_DIR), "push", "--quiet"],
+                capture_output=True, timeout=20)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
 
 # ── Arduino CLI integration ───────────────────────────────────────────────────
 
@@ -196,8 +447,8 @@ def ensure_esp32_core(log_cb) -> bool:
     return run_cli(["core", "install", "esp32:esp32"], log_cb) == 0
 
 
-def list_serial_ports() -> list[str]:
-    """Return detected serial port addresses."""
+def _detected_ports() -> list[dict]:
+    """Return arduino-cli's detected_ports entries (raw)."""
     cli = arduino_cli_path()
     if not cli:
         return []
@@ -208,14 +459,34 @@ def list_serial_ports() -> list[str]:
         )
         data = json.loads(out)
         ports = data.get("detected_ports", []) if isinstance(data, dict) else data
-        result = []
-        for entry in ports:
-            addr = entry.get("port", {}).get("address")
-            if addr:
-                result.append(addr)
-        return result
+        return ports or []
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
         return []
+
+
+def list_serial_ports() -> list[str]:
+    """Return detected serial port addresses."""
+    result = []
+    for entry in _detected_ports():
+        addr = entry.get("port", {}).get("address")
+        if addr:
+            result.append(addr)
+    return result
+
+
+def mac_from_port(port: str) -> str | None:
+    """Read the base MAC from the USB serial number of the given port.
+
+    On the ESP32-C6 (USB-Serial-JTAG) the ROM sets the USB descriptor serial
+    number to the base MAC — works without any firmware running."""
+    for entry in _detected_ports():
+        p = entry.get("port", {})
+        if p.get("address") == port:
+            sn = (p.get("properties") or {}).get("serialNumber", "")
+            m = MAC_RE.search(sn or "")
+            if m:
+                return m.group(1).upper()
+    return None
 
 
 def compile_and_upload(sketch_dir: Path, port: str, log_cb) -> bool:
@@ -604,6 +875,8 @@ class WifiButtonBuilder(tk.Tk):
         self._load_last_config()
         self.after(100, self._drain_status_queue)
         threading.Thread(target=self._bootstrap, daemon=True).start()
+        # Pull the freshest shared DB in the background (non-fatal).
+        threading.Thread(target=wb_git_pull, daemon=True).start()
 
     def _build_ui(self):
         style = ttk.Style()
@@ -650,6 +923,14 @@ class WifiButtonBuilder(tk.Tk):
         ttk.Label(f, text="Device Name:").grid(row=0, column=0, sticky="w")
         self.device_name_var = tk.StringVar(value=self.config_data["device_name"])
         ttk.Entry(f, textvariable=self.device_name_var, width=30).grid(row=0, column=1, sticky="w", padx=(4, 0))
+
+        ttk.Label(f, text="Kunde:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.customer_var = tk.StringVar(value=self.config_data.get("customer", ""))
+        ttk.Entry(f, textvariable=self.customer_var, width=30).grid(row=1, column=1, sticky="w", padx=(4, 0), pady=(4, 0))
+
+        ttk.Label(f, text="Standort:").grid(row=1, column=2, sticky="e", pady=(4, 0))
+        self.location_var = tk.StringVar(value=self.config_data.get("location", ""))
+        ttk.Entry(f, textvariable=self.location_var, width=30).grid(row=1, column=3, sticky="w", padx=(4, 0), pady=(4, 0))
 
     def _build_wifi_section(self):
         f = ttk.LabelFrame(self.scroll_frame, text="WiFi", padding=8)
@@ -805,6 +1086,7 @@ class WifiButtonBuilder(tk.Tk):
         ttk.Button(f, text="Exportieren (.ino)", command=self._export).pack(side="left", padx=(0, 6))
         ttk.Button(f, text="Config speichern", command=self._save_config).pack(side="left", padx=(0, 6))
         ttk.Button(f, text="Config laden", command=self._load_config).pack(side="left", padx=(0, 6))
+        ttk.Button(f, text="Datenbank…", command=self._open_db_window).pack(side="left", padx=(0, 6))
 
     def _validate_config(self, cfg: dict) -> list[str]:
         errors = []
@@ -828,6 +1110,8 @@ class WifiButtonBuilder(tk.Tk):
     def _gather_config(self) -> dict:
         return {
             "device_name": self.device_name_var.get(),
+            "customer": self.customer_var.get(),
+            "location": self.location_var.get(),
             "wifi_ssid": self.ssid_var.get(),
             "wifi_password": self.pw_var.get(),
             "ip_mode": self.ip_mode_var.get(),
@@ -927,6 +1211,8 @@ class WifiButtonBuilder(tk.Tk):
 
     def _apply_config(self, cfg: dict):
         self.device_name_var.set(cfg.get("device_name", "wifi-button"))
+        self.customer_var.set(cfg.get("customer", ""))
+        self.location_var.set(cfg.get("location", ""))
         self.ssid_var.set(cfg.get("wifi_ssid", ""))
         self.pw_var.set(cfg.get("wifi_password", ""))
         # Migrate legacy bool → enum, and legacy "dhcp" → "dhcp_cache"
@@ -1053,9 +1339,9 @@ class WifiButtonBuilder(tk.Tk):
         (sketch_dir / f"{name}.ino").write_text(code, encoding="utf-8")
 
         self._auto_save_config()
-        self._open_flash_log(sketch_dir, port)
+        self._open_flash_log(sketch_dir, port, cfg)
 
-    def _open_flash_log(self, sketch_dir: Path, port: str):
+    def _open_flash_log(self, sketch_dir: Path, port: str, cfg: dict):
         win = tk.Toplevel(self)
         win.title(f"Flash → {port}")
         win.geometry("780x500")
@@ -1086,7 +1372,9 @@ class WifiButtonBuilder(tk.Tk):
 
         def worker():
             try:
-                compile_and_upload(sketch_dir, port, log_cb)
+                ok = compile_and_upload(sketch_dir, port, log_cb)
+                if ok:
+                    self._register_flash(port, cfg, log_cb)
             except Exception as e:
                 log_cb(f"✗ Exception: {e}")
 
@@ -1096,6 +1384,191 @@ class WifiButtonBuilder(tk.Tk):
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill="x", padx=4, pady=4)
         ttk.Button(btn_frame, text="Schließen", command=win.destroy).pack(side="right")
+
+    # ── Shared device DB ───────────────────────────────────────────────────
+
+    def _register_flash(self, port: str, cfg: dict, log_cb):
+        """After a successful flash, store the config in the shared DB."""
+        mac = mac_from_port(port)
+        if not mac:
+            log_cb("⚠ MAC nicht aus USB-Seriennummer lesbar — nicht in DB gespeichert.")
+            return
+        try:
+            wb_register(mac, cfg, generate_ino(cfg))
+        except Exception as e:
+            log_cb(f"⚠ DB-Eintrag fehlgeschlagen: {e}")
+            return
+        where = "ptouch/labels.db" if DB_GIT_DIR else DB_PATH.name
+        log_cb(f"✓ In DB gespeichert ({where}): {mac}")
+        wb_git_push(f"wifi-button: {mac} {cfg.get('device_name', '')} geflasht")
+
+    def _open_db_window(self):
+        win = tk.Toplevel(self)
+        src = "geteilt: ptouch/labels.db" if DB_GIT_DIR else f"lokal: {DB_PATH.name}"
+        win.title(f"Geräte-Datenbank — {src}")
+        win.geometry("960x520")
+
+        top = ttk.Frame(win, padding=6)
+        top.pack(fill="x")
+        ttk.Label(top, text="Suche:").pack(side="left")
+        search_var = tk.StringVar()
+        ent = ttk.Entry(top, textvariable=search_var, width=32)
+        ent.pack(side="left", padx=(4, 8))
+        ent.focus_set()
+        ttk.Button(top, text="Aktualisieren", command=lambda: refresh()).pack(side="left")
+        ttk.Button(top, text="⬇ CSV-Export…", command=lambda: export_csv()).pack(side="left", padx=(8, 0))
+        ttk.Label(top, text=src, foreground="gray").pack(side="right")
+
+        cols = ("customer", "location", "mac", "device_name", "ip", "ssid",
+                "buttons", "last_flashed", "count", "notes")
+        headings = {"customer": "Kunde", "location": "Standort", "mac": "MAC",
+                    "device_name": "Gerät", "ip": "IP", "ssid": "SSID",
+                    "buttons": "Buttons", "last_flashed": "zuletzt geflasht",
+                    "count": "#", "notes": "Notiz"}
+        widths = {"customer": 110, "location": 100, "mac": 130,
+                  "device_name": 110, "ip": 105, "ssid": 95, "buttons": 140,
+                  "last_flashed": 140, "count": 34, "notes": 110}
+
+        tree_frame = ttk.Frame(win)
+        tree_frame.pack(fill="both", expand=True, padx=6)
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+        sy = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sy.set)
+        for c in cols:
+            tree.heading(c, text=headings[c])
+            tree.column(c, width=widths[c], anchor="w")
+        sy.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
+
+        def fmt_buttons(js: str) -> str:
+            try:
+                arr = json.loads(js) if js else []
+            except Exception:
+                arr = []
+            if not arr:
+                return ""
+            first = arr[0].get("name", "") if isinstance(arr[0], dict) else ""
+            return f"{len(arr)} × {first}" + (" …" if len(arr) > 1 else "")
+
+        def refresh():
+            for iid in tree.get_children():
+                tree.delete(iid)
+            q = search_var.get().strip()
+            try:
+                rows = wb_search(q) if q else wb_all()
+            except Exception as e:
+                messagebox.showerror("DB-Fehler", str(e), parent=win)
+                return
+            for cust, loc, mac, name, ip, ssid, buttons, last, cnt, notes in rows:
+                tree.insert("", "end",
+                            values=(cust, loc, mac, name, ip, ssid,
+                                    fmt_buttons(buttons), last, cnt, notes))
+
+        search_var.trace_add("write", lambda *a: refresh())
+
+        def selected_mac():
+            sel = tree.selection()
+            return tree.item(sel[0], "values")[2] if sel else None
+
+        def load_selected():
+            mac = selected_mac()
+            if not mac:
+                return
+            cfg = wb_get_config(mac)
+            if not cfg:
+                messagebox.showerror("Fehler", "Keine Config gespeichert.", parent=win)
+                return
+            self._apply_config(cfg)
+            self.status_var.set(f"DB: Config von {mac} geladen")
+            win.destroy()
+
+        def delete_selected():
+            mac = selected_mac()
+            if not mac:
+                return
+            vals = tree.item(tree.selection()[0], "values")
+            if not messagebox.askyesno(
+                    "Löschen", f"{mac} ({vals[3]}) aus der DB löschen?", parent=win):
+                return
+            wb_delete(mac)
+            wb_git_push(f"wifi-button: {mac} gelöscht")
+            refresh()
+
+        def edit_notes():
+            mac = selected_mac()
+            if not mac:
+                return
+            from tkinter import simpledialog
+            vals = tree.item(tree.selection()[0], "values")
+            new = simpledialog.askstring(
+                "Notiz", f"Notiz für {mac}:",
+                initialvalue=vals[9], parent=win)
+            if new is None:
+                return
+            wb_set_notes(mac, new)
+            wb_git_push(f"wifi-button: Notiz {mac}")
+            refresh()
+
+        def show_details(_evt=None):
+            mac = selected_mac()
+            if not mac:
+                return
+            cfg = wb_get_config(mac)
+            ino = wb_get_ino(mac)
+            dwin = tk.Toplevel(win)
+            dwin.title(f"Details — {mac}")
+            dwin.geometry("720x560")
+            nb = ttk.Notebook(dwin)
+            nb.pack(fill="both", expand=True, padx=4, pady=4)
+            for label, content in [
+                ("Config (JSON)",
+                 json.dumps(cfg, indent=2, ensure_ascii=False) if cfg else "—"),
+                ("Sketch (.ino)", ino or "— (vor diesem Update geflasht)"),
+            ]:
+                frame = ttk.Frame(nb)
+                nb.add(frame, text=label)
+                txt = tk.Text(frame, wrap="none", font=("Menlo", 10))
+                sv = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
+                txt.configure(yscrollcommand=sv.set)
+                sv.pack(side="right", fill="y")
+                txt.pack(side="left", fill="both", expand=True)
+                txt.insert("1.0", content)
+                txt.configure(state="disabled")
+
+        tree.bind("<Double-1>", show_details)
+
+        def export_csv():
+            rows = wb_export_rows(search_var.get().strip())
+            if not rows:
+                messagebox.showinfo("Leer", "Keine Daten zum Exportieren.", parent=win)
+                return
+            path = filedialog.asksaveasfilename(
+                parent=win, defaultextension=".csv",
+                filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+                initialfile=f"wifi-buttons_{datetime.now():%Y%m%d}.csv")
+            if not path:
+                return
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                wr = csv.writer(fh, delimiter=";")
+                wr.writerow(WB_EXPORT_COLS)
+                wr.writerows(rows)
+            messagebox.showinfo("Exportiert", f"CSV gespeichert:\n{path}", parent=win)
+
+        btns = ttk.Frame(win, padding=6)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="In Editor laden", command=load_selected).pack(side="left")
+        ttk.Button(btns, text="Details", command=show_details).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="Notiz…", command=edit_notes).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="Löschen", command=delete_selected).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="Schließen", command=win.destroy).pack(side="right")
+
+        # Pull fresh data off the remote, then refresh (non-blocking).
+        def _pull_then_refresh():
+            wb_git_pull()
+            if win.winfo_exists():
+                win.after(0, refresh)
+        threading.Thread(target=_pull_then_refresh, daemon=True).start()
+        refresh()
 
 
 if __name__ == "__main__":
