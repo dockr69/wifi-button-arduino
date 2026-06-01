@@ -271,6 +271,78 @@ def wb_get_ino(mac: str) -> str:
     return (row[0] or "") if row else ""
 
 
+# Columns offered as builder dropdowns, most-recently-used first.
+_DISTINCT_OK = {"customer", "location", "ip", "gateway", "subnet", "dns",
+                "wifi_ssid", "device_name"}
+
+
+def wb_distinct(column: str) -> list[str]:
+    """Distinct non-empty values for a column, newest-first (for dropdowns)."""
+    if column not in _DISTINCT_OK:
+        return []
+    con = wb_db()
+    rows = con.execute(
+        f"SELECT {column}, MAX(last_flashed) m FROM wifi_buttons "
+        f"WHERE {column} IS NOT NULL AND {column} != '' "
+        f"GROUP BY {column} ORDER BY m DESC"
+    ).fetchall()
+    con.close()
+    return [r[0] for r in rows]
+
+
+def wb_macs() -> list[str]:
+    con = wb_db()
+    rows = con.execute(
+        "SELECT mac FROM wifi_buttons ORDER BY last_flashed DESC"
+    ).fetchall()
+    con.close()
+    return [r[0] for r in rows]
+
+
+def _devices_table_exists(con) -> bool:
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='devices'"
+    ).fetchone() is not None
+
+
+def wb_mac_labels() -> dict[str, str]:
+    """mac → 'Kunde / Standort · Tasterort' for every MAC in the shared DB.
+
+    Kunde/Standort come from the builder (wifi_buttons); the Tasterort (the
+    label text assigned in the ptouch tool, e.g. 'Eisenwaren Info') comes from
+    devices.freetext. Either part may be missing."""
+    con = wb_db()
+    kunde_ort: dict[str, str] = {}
+    for mac, cust, loc in con.execute(
+            "SELECT mac, COALESCE(customer,''), COALESCE(location,'') FROM wifi_buttons"):
+        kunde_ort[mac] = " / ".join(x for x in (cust, loc) if x)
+    tasterort: dict[str, str] = {}
+    if _devices_table_exists(con):
+        for mac, free in con.execute(
+                "SELECT mac, COALESCE(freetext,'') FROM devices"):
+            if free:
+                tasterort[mac] = free
+    con.close()
+    labels: dict[str, str] = {}
+    for mac in set(kunde_ort) | set(tasterort):
+        parts = [p for p in (kunde_ort.get(mac, ""), tasterort.get(mac, "")) if p]
+        labels[mac] = " · ".join(parts)
+    return labels
+
+
+def wb_get_meta(mac: str) -> tuple[str, str]:
+    """(customer, location) for a MAC from the builder's records.
+
+    Note: the ptouch freetext is the *Tasterort* (button position), NOT the
+    city, so it is deliberately not used to fill the Standort field here."""
+    con = wb_db()
+    row = con.execute(
+        "SELECT COALESCE(customer,''), COALESCE(location,'') "
+        "FROM wifi_buttons WHERE mac=?", (mac,)).fetchone()
+    con.close()
+    return row if row else ("", "")
+
+
 def wb_delete(mac: str) -> None:
     con = wb_db()
     con.execute("DELETE FROM wifi_buttons WHERE mac=?", (mac,))
@@ -472,6 +544,17 @@ def list_serial_ports() -> list[str]:
         if addr:
             result.append(addr)
     return result
+
+
+def connected_macs() -> list[str]:
+    """MACs of all currently connected boards, in one board-list pass."""
+    out = []
+    for entry in _detected_ports():
+        sn = (entry.get("port", {}).get("properties") or {}).get("serialNumber", "")
+        m = MAC_RE.search(sn or "")
+        if m:
+            out.append(m.group(1).upper())
+    return out
 
 
 def mac_from_port(port: str) -> str | None:
@@ -863,8 +946,8 @@ class WifiButtonBuilder(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ESP32-C6 WiFi Button Builder")
-        self.geometry("920x980")
-        self.minsize(820, 720)
+        self.geometry("1340x880")
+        self.minsize(1080, 660)
 
         self.config_data = dict(DEFAULT_CONFIG)
         self.button_editors: list[ButtonEditor] = []
@@ -873,10 +956,17 @@ class WifiButtonBuilder(tk.Tk):
 
         self._build_ui()
         self._load_last_config()
+        self._db_refresh()
+        self._refresh_db_dropdowns()
         self.after(100, self._drain_status_queue)
         threading.Thread(target=self._bootstrap, daemon=True).start()
-        # Pull the freshest shared DB in the background (non-fatal).
-        threading.Thread(target=wb_git_pull, daemon=True).start()
+        # Pull the freshest shared DB in the background, then refresh the panel.
+        threading.Thread(target=self._pull_and_refresh, daemon=True).start()
+
+    def _pull_and_refresh(self):
+        wb_git_pull()
+        # Refresh on the main thread (see _drain_status_queue).
+        self.status_queue.put(("db_changed", None))
 
     def _build_ui(self):
         style = ttk.Style()
@@ -888,11 +978,17 @@ class WifiButtonBuilder(tk.Tk):
                            relief="sunken", anchor="w", padding=(6, 2))
         status.pack(side="bottom", fill="x")
 
-        main = ttk.Frame(self, padding=8)
-        main.pack(side="top", fill="both", expand=True)
+        # Split window: config editor (left) | always-on device DB (right).
+        paned = ttk.PanedWindow(self, orient="horizontal")
+        paned.pack(side="top", fill="both", expand=True)
 
-        canvas = tk.Canvas(main, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(main, orient="vertical", command=canvas.yview)
+        left = ttk.Frame(paned, padding=(8, 8, 4, 8))
+        right = ttk.Frame(paned, padding=(4, 8, 8, 8))
+        paned.add(left, weight=3)
+        paned.add(right, weight=2)
+
+        canvas = tk.Canvas(left, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
         self.scroll_frame = ttk.Frame(canvas)
 
         self.scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -916,21 +1012,33 @@ class WifiButtonBuilder(tk.Tk):
         self._build_flash_section()
         self._build_actions()
 
+        self._build_db_panel(right)
+
     def _build_device_section(self):
         f = ttk.LabelFrame(self.scroll_frame, text="Gerät (Adafruit Feather ESP32-C6)", padding=8)
         f.pack(fill="x", pady=(0, 6))
 
         ttk.Label(f, text="Device Name:").grid(row=0, column=0, sticky="w")
         self.device_name_var = tk.StringVar(value=self.config_data["device_name"])
-        ttk.Entry(f, textvariable=self.device_name_var, width=30).grid(row=0, column=1, sticky="w", padx=(4, 0))
+        ttk.Entry(f, textvariable=self.device_name_var, width=28).grid(row=0, column=1, sticky="w", padx=(4, 0))
+
+        # MAC: pick a connected board or an existing DB device. Choosing a
+        # known MAC loads that device's full config into the editor.
+        ttk.Label(f, text="MAC:").grid(row=0, column=2, sticky="e", pady=(4, 0))
+        self.mac_var = tk.StringVar()
+        self.mac_combo = ttk.Combobox(f, textvariable=self.mac_var, width=24)
+        self.mac_combo.grid(row=0, column=3, sticky="w", padx=(4, 0), pady=(4, 0))
+        self.mac_combo.bind("<<ComboboxSelected>>", self._on_mac_selected)
 
         ttk.Label(f, text="Kunde:").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.customer_var = tk.StringVar(value=self.config_data.get("customer", ""))
-        ttk.Entry(f, textvariable=self.customer_var, width=30).grid(row=1, column=1, sticky="w", padx=(4, 0), pady=(4, 0))
+        self.customer_combo = ttk.Combobox(f, textvariable=self.customer_var, width=28)
+        self.customer_combo.grid(row=1, column=1, sticky="w", padx=(4, 0), pady=(4, 0))
 
         ttk.Label(f, text="Standort:").grid(row=1, column=2, sticky="e", pady=(4, 0))
         self.location_var = tk.StringVar(value=self.config_data.get("location", ""))
-        ttk.Entry(f, textvariable=self.location_var, width=30).grid(row=1, column=3, sticky="w", padx=(4, 0), pady=(4, 0))
+        self.location_combo = ttk.Combobox(f, textvariable=self.location_var, width=24)
+        self.location_combo.grid(row=1, column=3, sticky="w", padx=(4, 0), pady=(4, 0))
 
     def _build_wifi_section(self):
         f = ttk.LabelFrame(self.scroll_frame, text="WiFi", padding=8)
@@ -958,18 +1066,22 @@ class WifiButtonBuilder(tk.Tk):
                             variable=self.ip_mode_var,
                             command=self._on_ip_mode_change).pack(side="left", padx=(8, 0))
 
-        row += 1
-        labels = [("IP:", "static_ip"), ("Gateway:", "gateway"), ("Subnet:", "subnet"), ("DNS:", "dns")]
+        # IP fields are editable comboboxes pre-filled with previously used
+        # values from the DB (Gateway/Subnet/DNS rarely change per site).
+        labels = [("IP:", "static_ip"), ("Gateway:", "gateway"),
+                  ("Subnet:", "subnet"), ("DNS:", "dns")]
         self.ip_vars = {}
         self.ip_entries = {}
         for i, (label, key) in enumerate(labels):
-            c = i * 2
-            ttk.Label(f, text=label).grid(row=row, column=c, sticky="w")
+            r = row + 1 + (i // 2)
+            c = (i % 2) * 2
+            ttk.Label(f, text=label).grid(row=r, column=c, sticky="w", pady=(4, 0))
             var = tk.StringVar(value=self.config_data[key])
             self.ip_vars[key] = var
-            ent = ttk.Entry(f, textvariable=var, width=16)
-            ent.grid(row=row, column=c + 1, sticky="w", padx=(4, 4))
-            self.ip_entries[key] = ent
+            cb = ttk.Combobox(f, textvariable=var, width=18)
+            cb.grid(row=r, column=c + 1, sticky="w", padx=(4, 12), pady=(4, 0))
+            self.ip_entries[key] = cb
+        row += 2
         self._on_ip_mode_change()
 
         row += 1
@@ -1086,7 +1198,51 @@ class WifiButtonBuilder(tk.Tk):
         ttk.Button(f, text="Exportieren (.ino)", command=self._export).pack(side="left", padx=(0, 6))
         ttk.Button(f, text="Config speichern", command=self._save_config).pack(side="left", padx=(0, 6))
         ttk.Button(f, text="Config laden", command=self._load_config).pack(side="left", padx=(0, 6))
-        ttk.Button(f, text="Datenbank…", command=self._open_db_window).pack(side="left", padx=(0, 6))
+        ttk.Button(f, text="In DB speichern…", command=self._save_to_db).pack(side="left", padx=(0, 6))
+
+    def _resolve_mac(self) -> str | None:
+        """MAC for DB writes: the MAC field, else the connected board, else ask."""
+        raw = self.mac_var.get().strip()
+        if not raw:
+            port = self.port_var.get().strip()
+            raw = mac_from_port(port) if port else None
+        if not raw:
+            from tkinter import simpledialog
+            raw = simpledialog.askstring(
+                "MAC eingeben",
+                "Keine MAC gewählt/gelesen (kein Board verbunden?).\n"
+                "Bitte MAC manuell eingeben (Format AA:BB:CC:DD:EE:FF):",
+                parent=self)
+            if not raw:
+                return None
+        m = MAC_RE.search(raw.strip())
+        if not m:
+            messagebox.showerror("Ungültige MAC",
+                                 f'"{raw}" ist keine gültige MAC-Adresse.')
+            return None
+        return m.group(1).upper()
+
+    def _save_to_db(self):
+        """Register the current config in the shared DB without flashing."""
+        cfg = self._gather_config()
+        errors = self._validate_config(cfg)
+        if errors:
+            messagebox.showerror("Ungültige Konfiguration", "\n".join(errors))
+            return
+        mac = self._resolve_mac()
+        if not mac:
+            return
+        try:
+            wb_register(mac, cfg, generate_ino(cfg))
+        except Exception as e:
+            messagebox.showerror("DB-Fehler", str(e))
+            return
+        where = "ptouch/labels.db" if DB_GIT_DIR else DB_PATH.name
+        wb_git_push(f"wifi-button: {mac} {cfg.get('device_name', '')} (manuell)")
+        self.mac_var.set(mac)
+        self.status_var.set(f"In DB gespeichert ({where}): {mac}")
+        self._db_refresh()
+        self._refresh_db_dropdowns()
 
     def _validate_config(self, cfg: dict) -> list[str]:
         errors = []
@@ -1291,6 +1447,11 @@ class WifiButtonBuilder(tk.Tk):
                     self.bootstrap_ready = True
                     self.flash_button.configure(state="normal")
                     self._refresh_ports()
+                elif kind == "db_changed":
+                    if payload:
+                        self.mac_var.set(payload)
+                    self._db_refresh()
+                    self._refresh_db_dropdowns()
         except queue.Empty:
             pass
         self.after(200, self._drain_status_queue)
@@ -1319,6 +1480,8 @@ class WifiButtonBuilder(tk.Tk):
         self.port_combo["values"] = filtered or ports
         if (filtered or ports) and not self.port_var.get():
             self.port_var.set((filtered or ports)[0])
+        # Connected boards may now expose a MAC → refresh the dropdowns.
+        self._refresh_db_dropdowns()
 
     def _flash(self):
         cfg = self._gather_config()
@@ -1388,7 +1551,10 @@ class WifiButtonBuilder(tk.Tk):
     # ── Shared device DB ───────────────────────────────────────────────────
 
     def _register_flash(self, port: str, cfg: dict, log_cb):
-        """After a successful flash, store the config in the shared DB."""
+        """After a successful flash, store the config in the shared DB.
+
+        Runs in the flash worker thread, so UI updates are marshalled back to
+        the main thread via self.after."""
         mac = mac_from_port(port)
         if not mac:
             log_cb("⚠ MAC nicht aus USB-Seriennummer lesbar — nicht in DB gespeichert.")
@@ -1401,174 +1567,212 @@ class WifiButtonBuilder(tk.Tk):
         where = "ptouch/labels.db" if DB_GIT_DIR else DB_PATH.name
         log_cb(f"✓ In DB gespeichert ({where}): {mac}")
         wb_git_push(f"wifi-button: {mac} {cfg.get('device_name', '')} geflasht")
+        # Marshal the UI refresh onto the main thread via the status queue.
+        self.status_queue.put(("db_changed", mac))
 
-    def _open_db_window(self):
-        win = tk.Toplevel(self)
+    # ── Inline device-DB panel (right pane) ───────────────────────────────
+
+    def _build_db_panel(self, parent):
         src = "geteilt: ptouch/labels.db" if DB_GIT_DIR else f"lokal: {DB_PATH.name}"
-        win.title(f"Geräte-Datenbank — {src}")
-        win.geometry("960x520")
+        f = ttk.LabelFrame(parent, text="Datenbank (Klick = in Editor laden)", padding=6)
+        f.pack(fill="both", expand=True)
 
-        top = ttk.Frame(win, padding=6)
+        top = ttk.Frame(f)
         top.pack(fill="x")
         ttk.Label(top, text="Suche:").pack(side="left")
-        search_var = tk.StringVar()
-        ent = ttk.Entry(top, textvariable=search_var, width=32)
-        ent.pack(side="left", padx=(4, 8))
-        ent.focus_set()
-        ttk.Button(top, text="Aktualisieren", command=lambda: refresh()).pack(side="left")
-        ttk.Button(top, text="⬇ CSV-Export…", command=lambda: export_csv()).pack(side="left", padx=(8, 0))
-        ttk.Label(top, text=src, foreground="gray").pack(side="right")
+        self.db_search_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.db_search_var, width=22).pack(side="left", padx=(4, 6))
+        ttk.Button(top, text="⟳", width=3, command=self._db_refresh).pack(side="left")
+        ttk.Button(top, text="⬇ CSV", command=self._db_export_csv).pack(side="left", padx=(6, 0))
+        self.db_search_var.trace_add("write", lambda *a: self._db_refresh())
 
-        cols = ("customer", "location", "mac", "device_name", "ip", "ssid",
-                "buttons", "last_flashed", "count", "notes")
+        cols = ("customer", "location", "mac", "device_name", "ip", "buttons", "count")
         headings = {"customer": "Kunde", "location": "Standort", "mac": "MAC",
-                    "device_name": "Gerät", "ip": "IP", "ssid": "SSID",
-                    "buttons": "Buttons", "last_flashed": "zuletzt geflasht",
-                    "count": "#", "notes": "Notiz"}
-        widths = {"customer": 110, "location": 100, "mac": 130,
-                  "device_name": 110, "ip": 105, "ssid": 95, "buttons": 140,
-                  "last_flashed": 140, "count": 34, "notes": 110}
-
-        tree_frame = ttk.Frame(win)
-        tree_frame.pack(fill="both", expand=True, padx=6)
-        tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
-        sy = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=sy.set)
+                    "device_name": "Gerät", "ip": "IP", "buttons": "Buttons",
+                    "count": "#"}
+        widths = {"customer": 90, "location": 80, "mac": 120, "device_name": 90,
+                  "ip": 95, "buttons": 110, "count": 28}
+        tree_frame = ttk.Frame(f)
+        tree_frame.pack(fill="both", expand=True, pady=(6, 0))
+        self.db_tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+        sy = ttk.Scrollbar(tree_frame, orient="vertical", command=self.db_tree.yview)
+        self.db_tree.configure(yscrollcommand=sy.set)
         for c in cols:
-            tree.heading(c, text=headings[c])
-            tree.column(c, width=widths[c], anchor="w")
+            self.db_tree.heading(c, text=headings[c])
+            self.db_tree.column(c, width=widths[c], anchor="w")
         sy.pack(side="right", fill="y")
-        tree.pack(side="left", fill="both", expand=True)
+        self.db_tree.pack(side="left", fill="both", expand=True)
+        # Single click on a row → load that device into the editor.
+        self.db_tree.bind("<<TreeviewSelect>>", lambda e: self._db_load_selected())
 
-        def fmt_buttons(js: str) -> str:
-            try:
-                arr = json.loads(js) if js else []
-            except Exception:
-                arr = []
-            if not arr:
-                return ""
-            first = arr[0].get("name", "") if isinstance(arr[0], dict) else ""
-            return f"{len(arr)} × {first}" + (" …" if len(arr) > 1 else "")
+        btns = ttk.Frame(f)
+        btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(btns, text="Details", command=self._db_show_details).pack(side="left")
+        ttk.Button(btns, text="Notiz…", command=self._db_edit_notes).pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="Löschen", command=self._db_delete_selected).pack(side="left", padx=(6, 0))
+        ttk.Label(f, text=src, foreground="gray").pack(anchor="w", pady=(4, 0))
 
-        def refresh():
-            for iid in tree.get_children():
-                tree.delete(iid)
-            q = search_var.get().strip()
-            try:
-                rows = wb_search(q) if q else wb_all()
-            except Exception as e:
-                messagebox.showerror("DB-Fehler", str(e), parent=win)
-                return
-            for cust, loc, mac, name, ip, ssid, buttons, last, cnt, notes in rows:
-                tree.insert("", "end",
-                            values=(cust, loc, mac, name, ip, ssid,
-                                    fmt_buttons(buttons), last, cnt, notes))
+    @staticmethod
+    def _fmt_buttons(js: str) -> str:
+        try:
+            arr = json.loads(js) if js else []
+        except Exception:
+            arr = []
+        if not arr:
+            return ""
+        first = arr[0].get("name", "") if isinstance(arr[0], dict) else ""
+        return f"{len(arr)} × {first}" + (" …" if len(arr) > 1 else "")
 
-        search_var.trace_add("write", lambda *a: refresh())
+    def _db_selected_mac(self):
+        sel = self.db_tree.selection()
+        return self.db_tree.item(sel[0], "values")[2] if sel else None
 
-        def selected_mac():
-            sel = tree.selection()
-            return tree.item(sel[0], "values")[2] if sel else None
+    def _db_refresh(self):
+        if not hasattr(self, "db_tree"):
+            return
+        for iid in self.db_tree.get_children():
+            self.db_tree.delete(iid)
+        q = self.db_search_var.get().strip()
+        try:
+            rows = wb_search(q) if q else wb_all()
+        except Exception as e:
+            self.status_var.set(f"DB-Fehler: {e}")
+            return
+        for cust, loc, mac, name, ip, _ssid, buttons, _last, cnt, _notes in rows:
+            self.db_tree.insert("", "end",
+                                 values=(cust, loc, mac, name, ip,
+                                         self._fmt_buttons(buttons), cnt))
 
-        def load_selected():
-            mac = selected_mac()
-            if not mac:
-                return
-            cfg = wb_get_config(mac)
-            if not cfg:
-                messagebox.showerror("Fehler", "Keine Config gespeichert.", parent=win)
-                return
+    def _refresh_db_dropdowns(self):
+        """Populate the customer/location/MAC/IP comboboxes from the DB and
+        pre-fill empty network fields from the most-recent device."""
+        if not hasattr(self, "customer_combo"):
+            return
+        self.customer_combo["values"] = wb_distinct("customer")
+        self.location_combo["values"] = wb_distinct("location")
+        # MAC dropdown: connected boards first, then known DB devices. Each
+        # entry shows its Kunde/Standort (from the builder or PTouch) so a
+        # board is recognisable without remembering its MAC.
+        labels = wb_mac_labels()
+        # Union: connected boards, then every MAC known to the shared DB
+        # (flashed devices AND MACs only tagged in PTouch).
+        seen, mac_values = set(), []
+        for m in connected_macs() + wb_macs() + list(labels.keys()):
+            if m in seen:
+                continue
+            seen.add(m)
+            lbl = labels.get(m, "")
+            mac_values.append(f"{m}  —  {lbl}" if lbl else m)
+        self.mac_combo["values"] = mac_values
+        for key in ("static_ip", "gateway", "subnet", "dns"):
+            vals = wb_distinct("ip" if key == "static_ip" else key)
+            self.ip_entries[key]["values"] = vals
+            # Carry network settings over: fill an empty field with the newest.
+            if vals and not self.ip_vars[key].get().strip():
+                self.ip_vars[key].set(vals[0])
+
+    def _on_mac_selected(self, _evt=None):
+        """Picking a MAC loads its full config, or at least its Kunde/Standort."""
+        m = MAC_RE.search(self.mac_var.get())
+        if not m:
+            return
+        mac = m.group(1).upper()
+        self.mac_var.set(mac)
+        cfg = wb_get_config(mac)
+        if cfg:
             self._apply_config(cfg)
+            self.mac_var.set(mac)
             self.status_var.set(f"DB: Config von {mac} geladen")
-            win.destroy()
+            return
+        # No full config yet (e.g. only tagged in PTouch) → prefill Kunde/Standort.
+        cust, loc = wb_get_meta(mac)
+        if cust:
+            self.customer_var.set(cust)
+        if loc:
+            self.location_var.set(loc)
+        self.status_var.set(f"{mac}: Kunde/Standort aus DB übernommen" if (cust or loc)
+                            else f"{mac}: noch keine Daten in der DB")
 
-        def delete_selected():
-            mac = selected_mac()
-            if not mac:
-                return
-            vals = tree.item(tree.selection()[0], "values")
-            if not messagebox.askyesno(
-                    "Löschen", f"{mac} ({vals[3]}) aus der DB löschen?", parent=win):
-                return
-            wb_delete(mac)
-            wb_git_push(f"wifi-button: {mac} gelöscht")
-            refresh()
+    def _db_load_selected(self):
+        mac = self._db_selected_mac()
+        if not mac:
+            return
+        cfg = wb_get_config(mac)
+        if not cfg:
+            return
+        self._apply_config(cfg)
+        self.mac_var.set(mac)
+        self.status_var.set(f"DB: Config von {mac} geladen")
 
-        def edit_notes():
-            mac = selected_mac()
-            if not mac:
-                return
-            from tkinter import simpledialog
-            vals = tree.item(tree.selection()[0], "values")
-            new = simpledialog.askstring(
-                "Notiz", f"Notiz für {mac}:",
-                initialvalue=vals[9], parent=win)
-            if new is None:
-                return
-            wb_set_notes(mac, new)
-            wb_git_push(f"wifi-button: Notiz {mac}")
-            refresh()
+    def _db_delete_selected(self):
+        mac = self._db_selected_mac()
+        if not mac:
+            return
+        vals = self.db_tree.item(self.db_tree.selection()[0], "values")
+        if not messagebox.askyesno("Löschen", f"{mac} ({vals[3]}) aus der DB löschen?"):
+            return
+        wb_delete(mac)
+        wb_git_push(f"wifi-button: {mac} gelöscht")
+        self._db_refresh()
+        self._refresh_db_dropdowns()
 
-        def show_details(_evt=None):
-            mac = selected_mac()
-            if not mac:
-                return
-            cfg = wb_get_config(mac)
-            ino = wb_get_ino(mac)
-            dwin = tk.Toplevel(win)
-            dwin.title(f"Details — {mac}")
-            dwin.geometry("720x560")
-            nb = ttk.Notebook(dwin)
-            nb.pack(fill="both", expand=True, padx=4, pady=4)
-            for label, content in [
-                ("Config (JSON)",
-                 json.dumps(cfg, indent=2, ensure_ascii=False) if cfg else "—"),
-                ("Sketch (.ino)", ino or "— (vor diesem Update geflasht)"),
-            ]:
-                frame = ttk.Frame(nb)
-                nb.add(frame, text=label)
-                txt = tk.Text(frame, wrap="none", font=("Menlo", 10))
-                sv = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
-                txt.configure(yscrollcommand=sv.set)
-                sv.pack(side="right", fill="y")
-                txt.pack(side="left", fill="both", expand=True)
-                txt.insert("1.0", content)
-                txt.configure(state="disabled")
+    def _db_edit_notes(self):
+        mac = self._db_selected_mac()
+        if not mac:
+            return
+        from tkinter import simpledialog
+        con = wb_db()
+        row = con.execute("SELECT COALESCE(notes,'') FROM wifi_buttons WHERE mac=?", (mac,)).fetchone()
+        con.close()
+        new = simpledialog.askstring("Notiz", f"Notiz für {mac}:",
+                                     initialvalue=row[0] if row else "", parent=self)
+        if new is None:
+            return
+        wb_set_notes(mac, new)
+        wb_git_push(f"wifi-button: Notiz {mac}")
+        self._db_refresh()
 
-        tree.bind("<Double-1>", show_details)
+    def _db_show_details(self):
+        mac = self._db_selected_mac()
+        if not mac:
+            return
+        cfg = wb_get_config(mac)
+        ino = wb_get_ino(mac)
+        dwin = tk.Toplevel(self)
+        dwin.title(f"Details — {mac}")
+        dwin.geometry("720x560")
+        nb = ttk.Notebook(dwin)
+        nb.pack(fill="both", expand=True, padx=4, pady=4)
+        for label, content in [
+            ("Config (JSON)", json.dumps(cfg, indent=2, ensure_ascii=False) if cfg else "—"),
+            ("Sketch (.ino)", ino or "— (vor diesem Update geflasht)"),
+        ]:
+            frame = ttk.Frame(nb)
+            nb.add(frame, text=label)
+            txt = tk.Text(frame, wrap="none", font=("Menlo", 10))
+            sv = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
+            txt.configure(yscrollcommand=sv.set)
+            sv.pack(side="right", fill="y")
+            txt.pack(side="left", fill="both", expand=True)
+            txt.insert("1.0", content)
+            txt.configure(state="disabled")
 
-        def export_csv():
-            rows = wb_export_rows(search_var.get().strip())
-            if not rows:
-                messagebox.showinfo("Leer", "Keine Daten zum Exportieren.", parent=win)
-                return
-            path = filedialog.asksaveasfilename(
-                parent=win, defaultextension=".csv",
-                filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
-                initialfile=f"wifi-buttons_{datetime.now():%Y%m%d}.csv")
-            if not path:
-                return
-            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
-                wr = csv.writer(fh, delimiter=";")
-                wr.writerow(WB_EXPORT_COLS)
-                wr.writerows(rows)
-            messagebox.showinfo("Exportiert", f"CSV gespeichert:\n{path}", parent=win)
-
-        btns = ttk.Frame(win, padding=6)
-        btns.pack(fill="x")
-        ttk.Button(btns, text="In Editor laden", command=load_selected).pack(side="left")
-        ttk.Button(btns, text="Details", command=show_details).pack(side="left", padx=(6, 0))
-        ttk.Button(btns, text="Notiz…", command=edit_notes).pack(side="left", padx=(6, 0))
-        ttk.Button(btns, text="Löschen", command=delete_selected).pack(side="left", padx=(6, 0))
-        ttk.Button(btns, text="Schließen", command=win.destroy).pack(side="right")
-
-        # Pull fresh data off the remote, then refresh (non-blocking).
-        def _pull_then_refresh():
-            wb_git_pull()
-            if win.winfo_exists():
-                win.after(0, refresh)
-        threading.Thread(target=_pull_then_refresh, daemon=True).start()
-        refresh()
+    def _db_export_csv(self):
+        rows = wb_export_rows(self.db_search_var.get().strip())
+        if not rows:
+            messagebox.showinfo("Leer", "Keine Daten zum Exportieren.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+            initialfile=f"wifi-buttons_{datetime.now():%Y%m%d}.csv")
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+            wr = csv.writer(fh, delimiter=";")
+            wr.writerow(WB_EXPORT_COLS)
+            wr.writerows(rows)
+        messagebox.showinfo("Exportiert", f"CSV gespeichert:\n{path}")
 
 
 if __name__ == "__main__":
