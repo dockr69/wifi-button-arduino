@@ -13,7 +13,6 @@ import os
 import re
 import ipaddress
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -91,132 +90,58 @@ FQBN = "esp32:esp32:adafruit_feather_esp32c6"
 MAINTENANCE_HOLD_MS = 5000
 MAINTENANCE_MS = 60000
 
-# ── Shared device DB (ptouch/labels.db) ────────────────────────────────────────
+# ── Shared device DB (Pi HTTP service) ──────────────────────────────────────
 #
-# The ptouch label tool keeps a git-synced SQLite DB (labels.db) keyed by the
-# device MAC. We reuse that exact file so a flashed button's full config (IP,
-# WiFi, HTTP actions …) lives next to its printed-label record and PTouch can
-# show everything. The ptouch repo is private, so storing the WiFi password in
-# plaintext is acceptable. If the ptouch repo isn't checked out beside us, we
-# fall back to a local buttons.db (no git sync).
+# The DB lives on the Raspberry Pi behind a small typed HTTP service
+# (ptouch/db_server.py): single source of truth, live, no git-sync conflicts.
+# These wb_* helpers keep their old signatures but talk to that service, so the
+# UI code is unchanged. Configure via env: WIFI_BUTTON_DB_URL (default the Pi's
+# Tailscale address) and PTOUCH_DB_TOKEN (or ~/.ptouch_db_token).
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PTOUCH_DIR = Path(os.environ.get(
-    "WIFI_BUTTON_PTOUCH_DIR",
-    str(SCRIPT_DIR.parent.parent / "ptouch"),
-))
-if PTOUCH_DIR.is_dir():
-    DB_PATH = PTOUCH_DIR / "labels.db"
-    DB_GIT_DIR: Path | None = PTOUCH_DIR
-else:
-    DB_PATH = SCRIPT_DIR / "buttons.db"
-    DB_GIT_DIR = None
+import urllib.parse
+import urllib.error
 
-WB_SCHEMA = """
-CREATE TABLE IF NOT EXISTS wifi_buttons (
-    mac           TEXT PRIMARY KEY,
-    customer      TEXT,
-    location      TEXT,
-    device_name   TEXT,
-    ip_mode       TEXT,
-    ip            TEXT,
-    gateway       TEXT,
-    subnet        TEXT,
-    dns           TEXT,
-    wifi_ssid     TEXT,
-    wifi_password TEXT,
-    buttons       TEXT,
-    config_json   TEXT,
-    ino           TEXT,
-    first_seen    TEXT,
-    last_flashed  TEXT,
-    flash_count   INTEGER NOT NULL DEFAULT 0,
-    notes         TEXT
-);
-"""
+DB_API_URL = os.environ.get(
+    "WIFI_BUTTON_DB_URL", "http://100.68.10.42:8889").rstrip("/")
+_TOKEN_FILE = Path.home() / ".ptouch_db_token"
+DB_API_TOKEN = os.environ.get("PTOUCH_DB_TOKEN", "") or (
+    _TOKEN_FILE.read_text().strip() if _TOKEN_FILE.exists() else "")
 
 
-def wb_db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
-    con.executescript(WB_SCHEMA)
-    # Migration for DBs created before a column existed.
-    have = [r[1] for r in con.execute("PRAGMA table_info(wifi_buttons)").fetchall()]
-    for col in ("ino", "customer", "location"):
-        if col not in have:
-            con.execute(f"ALTER TABLE wifi_buttons ADD COLUMN {col} TEXT")
-    con.commit()
-    return con
+class DBUnavailable(RuntimeError):
+    """The Pi DB service could not be reached."""
+
+
+def _api(method: str, path: str, params: dict | None = None,
+         body: dict | None = None, timeout: float = 10):
+    url = f"{DB_API_URL}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"X-Auth-Token": DB_API_TOKEN}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.URLError as e:
+        raise DBUnavailable(str(e)) from e
 
 
 def wb_register(mac: str, cfg: dict, ino: str = "") -> None:
     """Insert or update a device's full config (+ generated .ino), keyed by MAC."""
-    mac = mac.upper()
-    now = datetime.now().isoformat(timespec="seconds")
-    ip = cfg.get("static_ip", "") if cfg.get("ip_mode") == "static" else "DHCP"
-    buttons = json.dumps(cfg.get("buttons", []), ensure_ascii=False)
-    config_json = json.dumps(cfg, ensure_ascii=False)
-    con = wb_db()
-    con.execute(
-        """
-        INSERT INTO wifi_buttons
-            (mac, customer, location, device_name, ip_mode, ip, gateway,
-             subnet, dns, wifi_ssid, wifi_password, buttons, config_json, ino,
-             first_seen, last_flashed, flash_count, notes)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,'')
-        ON CONFLICT(mac) DO UPDATE SET
-            customer      = excluded.customer,
-            location      = excluded.location,
-            device_name   = excluded.device_name,
-            ip_mode       = excluded.ip_mode,
-            ip            = excluded.ip,
-            gateway       = excluded.gateway,
-            subnet        = excluded.subnet,
-            dns           = excluded.dns,
-            wifi_ssid     = excluded.wifi_ssid,
-            wifi_password = excluded.wifi_password,
-            buttons       = excluded.buttons,
-            config_json   = excluded.config_json,
-            ino           = excluded.ino,
-            last_flashed  = excluded.last_flashed,
-            flash_count   = wifi_buttons.flash_count + 1
-        """,
-        (mac, cfg.get("customer", ""), cfg.get("location", ""),
-         cfg.get("device_name", ""), cfg.get("ip_mode", ""), ip,
-         cfg.get("gateway", ""), cfg.get("subnet", ""), cfg.get("dns", ""),
-         cfg.get("wifi_ssid", ""), cfg.get("wifi_password", ""),
-         buttons, config_json, ino, now, now),
-    )
-    con.commit()
-    con.close()
-
-
-def _wb_rows(where: str = "", params: tuple = ()) -> list[tuple]:
-    con = wb_db()
-    rows = con.execute(
-        "SELECT COALESCE(customer,''), COALESCE(location,''), mac, "
-        "device_name, ip, wifi_ssid, buttons, "
-        "COALESCE(last_flashed,'—'), flash_count, COALESCE(notes,'') "
-        f"FROM wifi_buttons {where} "
-        "ORDER BY customer COLLATE NOCASE, location COLLATE NOCASE, "
-        "device_name COLLATE NOCASE",
-        params,
-    ).fetchall()
-    con.close()
-    return rows
+    _api("POST", "/wifi_buttons/register",
+         body={"mac": mac.upper(), "cfg": cfg, "ino": ino})
 
 
 def wb_all() -> list[tuple]:
-    return _wb_rows()
+    return [tuple(r) for r in _api("GET", "/wifi_buttons")["rows"]]
 
 
 def wb_search(query: str) -> list[tuple]:
-    like = f"%{query}%"
-    return _wb_rows(
-        "WHERE customer LIKE ? OR location LIKE ? OR mac LIKE ? "
-        "OR device_name LIKE ? OR ip LIKE ? OR wifi_ssid LIKE ? "
-        "OR buttons LIKE ? OR COALESCE(notes,'') LIKE ?",
-        (like, like, like, like, like, like, like, like),
-    )
+    return [tuple(r) for r in
+            _api("GET", "/wifi_buttons", params={"q": query})["rows"]]
 
 
 WB_EXPORT_COLS = ("customer", "location", "mac", "device_name", "ip_mode",
@@ -227,49 +152,17 @@ WB_EXPORT_COLS = ("customer", "location", "mac", "device_name", "ip_mode",
 
 def wb_export_rows(query: str = "") -> list[tuple]:
     """Full per-device rows for CSV export (everything that's configurable)."""
-    select = (
-        "SELECT COALESCE(customer,''), COALESCE(location,''), mac, "
-        "COALESCE(device_name,''), COALESCE(ip_mode,''), COALESCE(ip,''), "
-        "COALESCE(gateway,''), COALESCE(subnet,''), COALESCE(dns,''), "
-        "COALESCE(wifi_ssid,''), COALESCE(wifi_password,''), "
-        "COALESCE(buttons,''), COALESCE(first_seen,''), "
-        "COALESCE(last_flashed,''), COALESCE(flash_count,0), "
-        "COALESCE(notes,''), COALESCE(config_json,'') FROM wifi_buttons "
-    )
-    order = (" ORDER BY customer COLLATE NOCASE, location COLLATE NOCASE, "
-             "device_name COLLATE NOCASE")
-    con = wb_db()
-    if query:
-        like = f"%{query}%"
-        rows = con.execute(
-            select +
-            "WHERE customer LIKE ? OR location LIKE ? OR mac LIKE ? "
-            "OR device_name LIKE ? OR ip LIKE ? OR wifi_ssid LIKE ? "
-            "OR buttons LIKE ? OR COALESCE(notes,'') LIKE ?" + order,
-            (like, like, like, like, like, like, like, like),
-        ).fetchall()
-    else:
-        rows = con.execute(select + order).fetchall()
-    con.close()
-    return rows
+    params = {"q": query} if query else None
+    return [tuple(r) for r in
+            _api("GET", "/wifi_buttons/export", params=params)["rows"]]
 
 
 def wb_get_config(mac: str) -> dict | None:
-    con = wb_db()
-    row = con.execute(
-        "SELECT config_json FROM wifi_buttons WHERE mac=?", (mac,)
-    ).fetchone()
-    con.close()
-    return json.loads(row[0]) if row and row[0] else None
+    return _api("GET", f"/wifi_buttons/{mac}/config")["config"]
 
 
 def wb_get_ino(mac: str) -> str:
-    con = wb_db()
-    row = con.execute(
-        "SELECT ino FROM wifi_buttons WHERE mac=?", (mac,)
-    ).fetchone()
-    con.close()
-    return (row[0] or "") if row else ""
+    return _api("GET", f"/wifi_buttons/{mac}/ino")["ino"]
 
 
 # Columns offered as builder dropdowns, most-recently-used first.
@@ -281,127 +174,42 @@ def wb_distinct(column: str) -> list[str]:
     """Distinct non-empty values for a column, newest-first (for dropdowns)."""
     if column not in _DISTINCT_OK:
         return []
-    con = wb_db()
-    rows = con.execute(
-        f"SELECT {column}, MAX(last_flashed) m FROM wifi_buttons "
-        f"WHERE {column} IS NOT NULL AND {column} != '' "
-        f"GROUP BY {column} ORDER BY m DESC"
-    ).fetchall()
-    con.close()
-    return [r[0] for r in rows]
+    return _api("GET", f"/wifi_buttons/distinct/{column}")["values"]
 
 
 def wb_macs() -> list[str]:
-    con = wb_db()
-    rows = con.execute(
-        "SELECT mac FROM wifi_buttons ORDER BY last_flashed DESC"
-    ).fetchall()
-    con.close()
-    return [r[0] for r in rows]
-
-
-def _devices_table_exists(con) -> bool:
-    return con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='devices'"
-    ).fetchone() is not None
+    return _api("GET", "/wifi_buttons/macs")["macs"]
 
 
 def wb_mac_labels() -> dict[str, str]:
-    """mac → 'Kunde / Standort · Tasterort' for every MAC in the shared DB.
-
-    Kunde/Standort come from the builder (wifi_buttons); the Tasterort (the
-    label text assigned in the ptouch tool, e.g. 'Eisenwaren Info') comes from
-    devices.freetext. Either part may be missing."""
-    con = wb_db()
-    kunde_ort: dict[str, str] = {}
-    for mac, cust, loc in con.execute(
-            "SELECT mac, COALESCE(customer,''), COALESCE(location,'') FROM wifi_buttons"):
-        kunde_ort[mac] = " / ".join(x for x in (cust, loc) if x)
-    tasterort: dict[str, str] = {}
-    if _devices_table_exists(con):
-        for mac, free in con.execute(
-                "SELECT mac, COALESCE(freetext,'') FROM devices"):
-            if free:
-                tasterort[mac] = free
-    con.close()
-    labels: dict[str, str] = {}
-    for mac in set(kunde_ort) | set(tasterort):
-        parts = [p for p in (kunde_ort.get(mac, ""), tasterort.get(mac, "")) if p]
-        labels[mac] = " · ".join(parts)
-    return labels
+    """mac → 'Kunde / Standort · Tasterort' for every MAC in the shared DB."""
+    return _api("GET", "/mac_labels")["labels"]
 
 
 def wb_get_meta(mac: str) -> tuple[str, str]:
-    """(customer, location) for a MAC from the builder's records.
+    """(customer, location) for a MAC from the builder's records."""
+    m = _api("GET", f"/wifi_buttons/{mac}/meta")
+    return m["customer"], m["location"]
 
-    Note: the ptouch freetext is the *Tasterort* (button position), NOT the
-    city, so it is deliberately not used to fill the Standort field here."""
-    con = wb_db()
-    row = con.execute(
-        "SELECT COALESCE(customer,''), COALESCE(location,'') "
-        "FROM wifi_buttons WHERE mac=?", (mac,)).fetchone()
-    con.close()
-    return row if row else ("", "")
+
+def wb_get_notes(mac: str) -> str:
+    return _api("GET", f"/wifi_buttons/{mac}/notes")["notes"]
 
 
 def wb_delete(mac: str) -> None:
-    con = wb_db()
-    con.execute("DELETE FROM wifi_buttons WHERE mac=?", (mac,))
-    con.commit()
-    con.close()
+    _api("DELETE", f"/wifi_buttons/{mac}")
 
 
 def wb_set_notes(mac: str, notes: str) -> None:
-    con = wb_db()
-    con.execute("UPDATE wifi_buttons SET notes=? WHERE mac=?", (notes, mac))
-    con.commit()
-    con.close()
+    _api("POST", f"/wifi_buttons/{mac}/notes", body={"notes": notes})
 
 
-def wb_git_pull() -> None:
-    """Pull the latest DB from the ptouch remote (silent, non-fatal)."""
-    if DB_GIT_DIR is None:
-        return
+def db_version() -> int:
+    """Change marker for live polling; -1 if the service is unreachable."""
     try:
-        subprocess.run(
-            ["git", "-C", str(DB_GIT_DIR), "pull", "--rebase",
-             "--autostash", "--quiet"],
-            check=False, timeout=15, capture_output=True)
-    except Exception:
-        pass
-
-
-def wb_git_push(message: str) -> None:
-    """Commit + push the DB (async, fire-and-forget) via the ptouch repo."""
-    if DB_GIT_DIR is None:
-        return
-
-    def _run():
-        try:
-            r = subprocess.run(
-                ["git", "-C", str(DB_GIT_DIR), "add", str(DB_PATH)],
-                capture_output=True, timeout=10)
-            if r.returncode != 0:
-                return
-            r = subprocess.run(
-                ["git", "-C", str(DB_GIT_DIR), "diff", "--cached", "--quiet"],
-                capture_output=True)
-            if r.returncode == 0:
-                return  # nothing staged
-            subprocess.run(
-                ["git", "-C", str(DB_GIT_DIR), "commit", "-m", message],
-                capture_output=True, timeout=10)
-            subprocess.run(
-                ["git", "-C", str(DB_GIT_DIR), "pull", "--rebase",
-                 "--autostash", "--quiet"],
-                capture_output=True, timeout=15)
-            subprocess.run(
-                ["git", "-C", str(DB_GIT_DIR), "push", "--quiet"],
-                capture_output=True, timeout=20)
-        except Exception:
-            pass
-
-    threading.Thread(target=_run, daemon=True).start()
+        return _api("GET", "/version", timeout=5)["version"]
+    except DBUnavailable:
+        return -1
 
 
 # ── Arduino CLI integration ───────────────────────────────────────────────────
@@ -970,24 +778,17 @@ class WifiButtonBuilder(tk.Tk):
         # Continuously detect (un)plugged boards so the MAC dropdown stays live.
         threading.Thread(target=self._device_poller, daemon=True).start()
 
-    @staticmethod
-    def _db_signature():
-        """Cheap fingerprint of the DB file to detect changes after a pull."""
-        try:
-            st = DB_PATH.stat()
-            return (st.st_mtime_ns, st.st_size)
-        except OSError:
-            return None
-
     def _db_poller(self):
-        """Background loop: pull the shared DB and refresh the UI on change."""
-        last_sig = None  # force one refresh on first pass
+        """Background loop: refresh the UI whenever the Pi DB changes.
+
+        Polls the service's change marker (PRAGMA data_version) so edits made by
+        the P-Touch tool show up live, without any manual reload."""
+        last_ver = None  # force one refresh on first pass
         while True:
             try:
-                wb_git_pull()
-                sig = self._db_signature()
-                if sig != last_sig:
-                    last_sig = sig
+                ver = db_version()
+                if ver != -1 and ver != last_ver:
+                    last_ver = ver
                     # Refresh on the main thread (see _drain_status_queue).
                     self.status_queue.put(("db_changed", None))
             except Exception:
@@ -1261,10 +1062,8 @@ class WifiButtonBuilder(tk.Tk):
         except Exception as e:
             messagebox.showerror("DB-Fehler", str(e))
             return
-        where = "ptouch/labels.db" if DB_GIT_DIR else DB_PATH.name
-        wb_git_push(f"wifi-button: {mac} {cfg.get('device_name', '')} (manuell)")
         self.mac_var.set(mac)
-        self.status_var.set(f"In DB gespeichert ({where}): {mac}")
+        self.status_var.set(f"In DB gespeichert ({DB_API_URL}): {mac}")
         self._db_refresh()
         self._refresh_db_dropdowns()
 
@@ -1614,16 +1413,14 @@ class WifiButtonBuilder(tk.Tk):
         except Exception as e:
             log_cb(f"⚠ DB-Eintrag fehlgeschlagen: {e}")
             return
-        where = "ptouch/labels.db" if DB_GIT_DIR else DB_PATH.name
-        log_cb(f"✓ In DB gespeichert ({where}): {mac}")
-        wb_git_push(f"wifi-button: {mac} {cfg.get('device_name', '')} geflasht")
+        log_cb(f"✓ In DB gespeichert ({DB_API_URL}): {mac}")
         # Marshal the UI refresh onto the main thread via the status queue.
         self.status_queue.put(("db_changed", mac))
 
     # ── Inline device-DB panel (right pane) ───────────────────────────────
 
     def _build_db_panel(self, parent):
-        src = "geteilt: ptouch/labels.db" if DB_GIT_DIR else f"lokal: {DB_PATH.name}"
+        src = f"Pi: {DB_API_URL}"
         f = ttk.LabelFrame(parent, text="Datenbank (Klick = in Editor laden)", padding=6)
         f.pack(fill="both", expand=True)
 
@@ -1697,25 +1494,28 @@ class WifiButtonBuilder(tk.Tk):
         pre-fill empty network fields from the most-recent device."""
         if not hasattr(self, "customer_combo"):
             return
-        self.customer_combo["values"] = wb_distinct("customer")
-        self.location_combo["values"] = wb_distinct("location")
-        # MAC dropdown: connected boards first, then known DB devices. Each
-        # entry shows its Kunde/Standort (from the builder or PTouch) so a
-        # board is recognisable without remembering its MAC.
-        labels = wb_mac_labels()
-        # Union: connected boards, then every MAC known to the shared DB
-        # (flashed devices AND MACs only tagged in PTouch).
-        seen, mac_values = set(), []
-        for m in self._connected_macs + wb_macs() + list(labels.keys()):
-            if m in seen:
-                continue
-            seen.add(m)
-            lbl = labels.get(m, "")
-            mac_values.append(f"{m}  —  {lbl}" if lbl else m)
-        self.mac_combo["values"] = mac_values
-        for key in ("static_ip", "gateway", "subnet", "dns"):
-            vals = wb_distinct("ip" if key == "static_ip" else key)
-            self.ip_entries[key]["values"] = vals
+        try:
+            self.customer_combo["values"] = wb_distinct("customer")
+            self.location_combo["values"] = wb_distinct("location")
+            # MAC dropdown: connected boards first, then known DB devices. Each
+            # entry shows its Kunde/Standort (from the builder or PTouch) so a
+            # board is recognisable without remembering its MAC.
+            labels = wb_mac_labels()
+            # Union: connected boards, then every MAC known to the shared DB
+            # (flashed devices AND MACs only tagged in PTouch).
+            seen, mac_values = set(), []
+            for m in self._connected_macs + wb_macs() + list(labels.keys()):
+                if m in seen:
+                    continue
+                seen.add(m)
+                lbl = labels.get(m, "")
+                mac_values.append(f"{m}  —  {lbl}" if lbl else m)
+            self.mac_combo["values"] = mac_values
+            for key in ("static_ip", "gateway", "subnet", "dns"):
+                vals = wb_distinct("ip" if key == "static_ip" else key)
+                self.ip_entries[key]["values"] = vals
+        except DBUnavailable as e:
+            self.status_var.set(f"DB nicht erreichbar: {e}")
             # Carry network settings over: fill an empty field with the newest.
             if vals and not self.ip_vars[key].get().strip():
                 self.ip_vars[key].set(vals[0])
@@ -1761,7 +1561,6 @@ class WifiButtonBuilder(tk.Tk):
         if not messagebox.askyesno("Löschen", f"{mac} ({vals[3]}) aus der DB löschen?"):
             return
         wb_delete(mac)
-        wb_git_push(f"wifi-button: {mac} gelöscht")
         self._db_refresh()
         self._refresh_db_dropdowns()
 
@@ -1770,15 +1569,11 @@ class WifiButtonBuilder(tk.Tk):
         if not mac:
             return
         from tkinter import simpledialog
-        con = wb_db()
-        row = con.execute("SELECT COALESCE(notes,'') FROM wifi_buttons WHERE mac=?", (mac,)).fetchone()
-        con.close()
         new = simpledialog.askstring("Notiz", f"Notiz für {mac}:",
-                                     initialvalue=row[0] if row else "", parent=self)
+                                     initialvalue=wb_get_notes(mac), parent=self)
         if new is None:
             return
         wb_set_notes(mac, new)
-        wb_git_push(f"wifi-button: Notiz {mac}")
         self._db_refresh()
 
     def _db_show_details(self):
