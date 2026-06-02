@@ -19,6 +19,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import queue
 import urllib.request
 import zipfile
@@ -953,6 +954,9 @@ class WifiButtonBuilder(tk.Tk):
         self.button_editors: list[ButtonEditor] = []
         self.bootstrap_ready = False
         self.status_queue: queue.Queue = queue.Queue()
+        # Connected boards, kept fresh by a background poller (see _device_poller).
+        self._connected_macs: list[str] = []
+        self._scan_snapshot = None
 
         self._build_ui()
         self._load_last_config()
@@ -960,13 +964,35 @@ class WifiButtonBuilder(tk.Tk):
         self._refresh_db_dropdowns()
         self.after(100, self._drain_status_queue)
         threading.Thread(target=self._bootstrap, daemon=True).start()
-        # Pull the freshest shared DB in the background, then refresh the panel.
-        threading.Thread(target=self._pull_and_refresh, daemon=True).start()
+        # Keep the shared DB in sync: pull on a loop and refresh the panel
+        # whenever the file actually changes (no manual reload needed).
+        threading.Thread(target=self._db_poller, daemon=True).start()
+        # Continuously detect (un)plugged boards so the MAC dropdown stays live.
+        threading.Thread(target=self._device_poller, daemon=True).start()
 
-    def _pull_and_refresh(self):
-        wb_git_pull()
-        # Refresh on the main thread (see _drain_status_queue).
-        self.status_queue.put(("db_changed", None))
+    @staticmethod
+    def _db_signature():
+        """Cheap fingerprint of the DB file to detect changes after a pull."""
+        try:
+            st = DB_PATH.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _db_poller(self):
+        """Background loop: pull the shared DB and refresh the UI on change."""
+        last_sig = None  # force one refresh on first pass
+        while True:
+            try:
+                wb_git_pull()
+                sig = self._db_signature()
+                if sig != last_sig:
+                    last_sig = sig
+                    # Refresh on the main thread (see _drain_status_queue).
+                    self.status_queue.put(("db_changed", None))
+            except Exception:
+                pass
+            time.sleep(5)
 
     def _build_ui(self):
         style = ttk.Style()
@@ -1151,8 +1177,6 @@ class WifiButtonBuilder(tk.Tk):
         self.port_var = tk.StringVar()
         self.port_combo = ttk.Combobox(f, textvariable=self.port_var, width=30, state="readonly")
         self.port_combo.grid(row=0, column=1, sticky="w", padx=(4, 4))
-
-        ttk.Button(f, text="🔄", width=3, command=self._refresh_ports).grid(row=0, column=2, padx=(0, 8))
 
         self.flash_button = ttk.Button(f, text="⚡ Flash", command=self._flash, state="disabled")
         self.flash_button.grid(row=0, column=3, padx=(8, 0))
@@ -1446,7 +1470,14 @@ class WifiButtonBuilder(tk.Tk):
                 elif kind == "ready":
                     self.bootstrap_ready = True
                     self.flash_button.configure(state="normal")
-                    self._refresh_ports()
+                elif kind == "ports_changed":
+                    ports, macs = payload
+                    self._connected_macs = macs
+                    cur = self.port_var.get()
+                    self.port_combo["values"] = ports
+                    if cur not in ports:
+                        self.port_var.set(ports[0] if ports else "")
+                    self._refresh_db_dropdowns()
                 elif kind == "db_changed":
                     if payload:
                         self.mac_var.set(payload)
@@ -1473,15 +1504,34 @@ class WifiButtonBuilder(tk.Tk):
         except Exception as e:
             self._post_status(f"✗ Bootstrap-Fehler: {e}")
 
-    def _refresh_ports(self):
-        ports = list_serial_ports()
-        # Filter Bluetooth/debug noise on macOS
-        filtered = [p for p in ports if "Bluetooth" not in p and "debug-console" not in p]
-        self.port_combo["values"] = filtered or ports
-        if (filtered or ports) and not self.port_var.get():
-            self.port_var.set((filtered or ports)[0])
-        # Connected boards may now expose a MAC → refresh the dropdowns.
-        self._refresh_db_dropdowns()
+    def _scan_devices(self, force: bool = False):
+        """Detect ports + board MACs in ONE board-list call (runs in a thread).
+
+        Posts to the UI queue only when something changed (or when forced), so
+        the main thread never runs the arduino-cli subprocess itself."""
+        ports, macs = [], []
+        for entry in _detected_ports():
+            p = entry.get("port", {})
+            addr = p.get("address")
+            if addr:
+                ports.append(addr)
+            sn = (p.get("properties") or {}).get("serialNumber", "")
+            m = MAC_RE.search(sn or "")
+            if m:
+                macs.append(m.group(1).upper())
+        snapshot = (tuple(ports), tuple(macs))
+        if force or snapshot != self._scan_snapshot:
+            self._scan_snapshot = snapshot
+            self.status_queue.put(("ports_changed", (ports, macs)))
+
+    def _device_poller(self):
+        """Background loop: keep ports + MAC dropdown in sync with reality."""
+        while True:
+            try:
+                self._scan_devices()
+            except Exception:
+                pass
+            time.sleep(3)
 
     def _flash(self):
         cfg = self._gather_config()
@@ -1582,7 +1632,6 @@ class WifiButtonBuilder(tk.Tk):
         ttk.Label(top, text="Suche:").pack(side="left")
         self.db_search_var = tk.StringVar()
         ttk.Entry(top, textvariable=self.db_search_var, width=22).pack(side="left", padx=(4, 6))
-        ttk.Button(top, text="⟳", width=3, command=self._db_refresh).pack(side="left")
         ttk.Button(top, text="⬇ CSV", command=self._db_export_csv).pack(side="left", padx=(6, 0))
         self.db_search_var.trace_add("write", lambda *a: self._db_refresh())
 
@@ -1657,7 +1706,7 @@ class WifiButtonBuilder(tk.Tk):
         # Union: connected boards, then every MAC known to the shared DB
         # (flashed devices AND MACs only tagged in PTouch).
         seen, mac_values = set(), []
-        for m in connected_macs() + wb_macs() + list(labels.keys()):
+        for m in self._connected_macs + wb_macs() + list(labels.keys()):
             if m in seen:
                 continue
             seen.add(m)
