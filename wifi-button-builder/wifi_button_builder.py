@@ -595,6 +595,77 @@ def compile_and_upload(sketch_dir: Path, port: str, log_cb) -> bool:
     return True
 
 
+def _parse_button_url(url: str, method: str):
+    """(host, port, path, method) aus einer Button-URL — wie in generate_ino."""
+    m = re.match(r'https?://([^/:]+)(?::(\d+))?(/.*)?$', url or "")
+    if m:
+        return m.group(1), int(m.group(2) or 80), m.group(3) or "/", method
+    return "", 80, (url or "/"), method
+
+
+def _config_set_pairs(cfg: dict):
+    """cfg-Dict -> Liste (key, value) für das Base-Image-NVS (SET-Befehle)."""
+    pairs = [
+        ("ssid", cfg.get("wifi_ssid", "")),
+        ("pass", cfg.get("wifi_password", "")),
+        ("ipmode", cfg.get("ip_mode", "static")),
+        ("ip", cfg.get("static_ip", "")),
+        ("gw", cfg.get("gateway", "")),
+        ("sn", cfg.get("subnet", "")),
+        ("dns", cfg.get("dns", "")),
+        ("wifitmo", int(cfg.get("wifi_timeout_s", 10)) * 1000),
+        ("httptmo", int(cfg.get("http_timeout_s", 3)) * 1000),
+        ("repcnt", int(cfg.get("repeat_count", 1))),
+        ("repint", int(cfg.get("repeat_interval_s", 60)) * 1000),
+        ("cooldn", int(cfg.get("cooldown_s", 0)) * 1000000),
+        ("txpow", cfg.get("wifi_tx_power", "20dBm")),
+        ("psave", 1 if cfg.get("wifi_power_save") else 0),
+    ]
+    btns = cfg.get("buttons", [])
+    pairs.append(("btncnt", len(btns)))
+    for i, b in enumerate(btns):
+        host, port, path, meth = _parse_button_url(b.get("url", ""), b.get("method", "GET"))
+        pairs += [(f"b{i}host", host), (f"b{i}port", port),
+                  (f"b{i}path", path), (f"b{i}meth", meth)]
+    return pairs
+
+
+def send_config_serial(port: str, cfg: dict, log_cb) -> bool:
+    """Config per USB-Serial ins Base-Image-NVS schreiben (SET/SAVE) — kein
+    Recompile/Flash. Setzt voraus, dass das generische Base-Image geflasht ist
+    (ptouch) und das Board im Config-Modus lauscht (frisch geflasht / Reset)."""
+    import serial as _serial
+    try:
+        with _serial.Serial(port, 115200, timeout=2) as ser:
+            # Best-effort Reset über DTR -> Board bootet in den Config-Modus
+            try:
+                ser.dtr = False; time.sleep(0.1); ser.dtr = True
+            except Exception:
+                pass
+            time.sleep(1.8)
+            ser.reset_input_buffer()
+            ser.write(b"VER?\n"); time.sleep(0.4)
+            resp = ser.read(ser.in_waiting or 1).decode(errors="ignore")
+            if "VER wbtn" not in resp:
+                log_cb("✗ Keine Antwort vom Base-Image (VER?).")
+                log_cb("  Base-Image geflasht? (ptouch) Board kurz RESET/neu anstecken.")
+                return False
+            log_cb(f"✓ Base-Image erkannt: {resp.strip()}")
+            for k, v in _config_set_pairs(cfg):
+                ser.write(f"SET {k} {v}\n".encode()); time.sleep(0.04)
+                ser.read(ser.in_waiting or 0)
+            ser.write(b"SAVE\n"); time.sleep(0.6)
+            resp = ser.read(ser.in_waiting or 1).decode(errors="ignore")
+            if "OK saved" in resp:
+                log_cb("✓ Config ins NVS gespeichert. Button einsatzbereit.")
+                return True
+            log_cb(f"⚠ Unerwartete SAVE-Antwort: {resp.strip()}")
+            return False
+    except Exception as e:
+        log_cb(f"✗ Serial-Fehler: {e}")
+        return False
+
+
 # ── Code Generator ────────────────────────────────────────────────────────────
 
 
@@ -1186,7 +1257,7 @@ class WifiButtonBuilder(tk.Tk):
         self.port_combo = ttk.Combobox(f, textvariable=self.port_var, width=30, state="readonly")
         self.port_combo.grid(row=0, column=1, sticky="w", padx=(4, 4))
 
-        self.flash_button = ttk.Button(f, text="⚡ Flash", command=self._flash, state="disabled")
+        self.flash_button = ttk.Button(f, text="⚡ Config senden", command=self._flash, state="disabled")
         self.flash_button.grid(row=0, column=3, padx=(8, 0))
 
         ttk.Label(f, text="Adafruit Feather ESP32-C6 · Board im Bootloader-Modus (BOOT halten, RESET tippen)",
@@ -1552,19 +1623,12 @@ class WifiButtonBuilder(tk.Tk):
             messagebox.showerror("Kein Port", "Bitte einen seriellen Port auswählen.")
             return
 
-        code = generate_ino(cfg)
-        name = cfg["device_name"].replace(" ", "_") or "wifi_button"
-        sketch_root = Path(tempfile.mkdtemp(prefix="wifi-button-"))
-        sketch_dir = sketch_root / name
-        sketch_dir.mkdir()
-        (sketch_dir / f"{name}.ino").write_text(code, encoding="utf-8")
-
         self._auto_save_config()
-        self._open_flash_log(sketch_dir, port, cfg)
+        self._open_flash_log(port, cfg)
 
-    def _open_flash_log(self, sketch_dir: Path, port: str, cfg: dict):
+    def _open_flash_log(self, port: str, cfg: dict):
         win = tk.Toplevel(self)
-        win.title(f"Flash → {port}")
+        win.title(f"Config senden → {port}")
         win.geometry("780x500")
 
         text_frame = ttk.Frame(win)
@@ -1593,7 +1657,7 @@ class WifiButtonBuilder(tk.Tk):
 
         def worker():
             try:
-                ok = compile_and_upload(sketch_dir, port, log_cb)
+                ok = send_config_serial(port, cfg, log_cb)
                 if ok:
                     self._register_flash(port, cfg, log_cb)
             except Exception as e:
