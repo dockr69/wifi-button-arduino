@@ -969,7 +969,7 @@ class WifiButtonBuilder(tk.Tk):
         self._build_ui()
         self._load_last_config()
         self._db_refresh()
-        self._refresh_db_dropdowns()
+        self._refresh_db_dropdowns(prefill=True)
         self.after(100, self._drain_status_queue)
         threading.Thread(target=self._bootstrap, daemon=True).start()
         # Keep the shared DB in sync: pull on a loop and refresh the panel
@@ -1700,9 +1700,13 @@ class WifiButtonBuilder(tk.Tk):
                                  values=(cust, loc, mac, name, ip,
                                          self._fmt_buttons(buttons), cnt))
 
-    def _refresh_db_dropdowns(self):
-        """Populate the customer/location/MAC/IP comboboxes from the DB and
-        pre-fill empty network fields from the most-recent device."""
+    def _refresh_db_dropdowns(self, prefill: bool = False):
+        """Populate the customer/location/MAC/IP comboboxes from the DB.
+
+        Only pre-fills empty network fields from the most-recent device when
+        prefill=True (initial load / picking a new MAC). The 5s pollers call with
+        prefill=False so they never overwrite a field the user is editing — e.g.
+        clearing the IP to type a new one used to get refilled with a DB value."""
         if not hasattr(self, "customer_combo"):
             return
         self.customer_combo["values"] = wb_distinct("customer")
@@ -1725,7 +1729,8 @@ class WifiButtonBuilder(tk.Tk):
             vals = wb_distinct("ip" if key == "static_ip" else key)
             self.ip_entries[key]["values"] = vals
             # Carry network settings over: fill an empty field with the newest.
-            if vals and not self.ip_vars[key].get().strip():
+            # Guarded so background pollers can't clobber an in-progress edit.
+            if prefill and vals and not self.ip_vars[key].get().strip():
                 self.ip_vars[key].set(vals[0])
 
     def _on_mac_selected(self, _evt=None):
@@ -1750,6 +1755,9 @@ class WifiButtonBuilder(tk.Tk):
         if loc:
             self.location_var.set(loc)
         self.device_name_var.set(suggest_device_name(mac) or "wifi-button")
+        # Carry the site's network settings (gateway/subnet/dns/IP) into the
+        # fresh button — explicit user action, so prefilling empty fields is wanted.
+        self._refresh_db_dropdowns(prefill=True)
         self.status_var.set(f"{mac}: Kunde/Standort aus DB übernommen" if (cust or loc)
                             else f"{mac}: noch keine Daten in der DB")
 
