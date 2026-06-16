@@ -13,3 +13,7 @@ secrets.yaml
 # checked out beside this one). Contains WiFi passwords in plaintext — never
 # commit it to this public repo. The real DB lives in the private ptouch repo.
 buttons.db
+
+# Arduino-cli build artifacts
+firmware/**/build/
+firmware/**/out/
