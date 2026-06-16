@@ -344,6 +344,14 @@ def wb_get_meta(mac: str) -> tuple[str, str]:
     return row if row else ("", "")
 
 
+def suggest_device_name(mac: str) -> str:
+    """Device-Name suggestion = exactly the label shown next to the MAC in the
+    dropdown (Kunde / Standort · Tasterort, as assigned in PTouch). Pre-fills the
+    editable Device Name when a MAC is picked instead of carrying over the
+    previous button's name."""
+    return wb_mac_labels().get(mac, "").strip()
+
+
 def wb_delete(mac: str) -> None:
     con = wb_db()
     con.execute("DELETE FROM wifi_buttons WHERE mac=?", (mac,))
@@ -1733,12 +1741,15 @@ class WifiButtonBuilder(tk.Tk):
             self.mac_var.set(mac)
             self.status_var.set(f"DB: Config von {mac} geladen")
             return
-        # No full config yet (e.g. only tagged in PTouch) → prefill Kunde/Standort.
+        # No full config yet (e.g. only tagged in PTouch) → prefill Kunde/Standort
+        # and suggest an editable Device Name so the previous button's name does
+        # not silently carry over.
         cust, loc = wb_get_meta(mac)
         if cust:
             self.customer_var.set(cust)
         if loc:
             self.location_var.set(loc)
+        self.device_name_var.set(suggest_device_name(mac) or "wifi-button")
         self.status_var.set(f"{mac}: Kunde/Standort aus DB übernommen" if (cust or loc)
                             else f"{mac}: noch keine Daten in der DB")
 
