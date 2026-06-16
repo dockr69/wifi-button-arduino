@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:adafruit_feather_esp32c6:CDCOnBoot=cdc",
+  "hardwareFolders": "/Users/fabi/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8,/Users/fabi/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8",
+  "otherLibrariesFolders": "/Users/fabi/Documents/Arduino/libraries",
+  "sketchLocation": "/Users/fabi/development/wifi-button-arduino/firmware/wifi-button-base"
+}

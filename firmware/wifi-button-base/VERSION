@@ -1,0 +1,9 @@
+{
+  "chip": "esp32c6",
+  "fqbn": "esp32:esp32:adafruit_feather_esp32c6:CDCOnBoot=cdc",
+  "fw": 1,
+  "note": "USB CDC On Boot MUSS aktiviert sein (sonst Serial=UART0, kein USB-Config)",
+  "source_sha": "9ba8e098e37d61e132ff885e60a2943a731d3df59c65295a76ceda8c8aebc989",
+  "built_at": "2026-06-16T20:45:27+02:00",
+  "offsets": {"bootloader.bin":"0x0","partitions.bin":"0x8000","boot_app0.bin":"0xe000","firmware.bin":"0x10000"}
+}
