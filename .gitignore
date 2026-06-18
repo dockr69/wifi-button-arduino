@@ -23,3 +23,6 @@ buttons.db
 # Arduino-cli build artifacts
 firmware/**/build/
 firmware/**/out/
+
+# pytest
+.pytest_cache/

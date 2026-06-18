@@ -259,6 +259,112 @@ def wb_export_rows(query: str = "") -> list[tuple]:
     return rows
 
 
+# ── DB export / import (verlustfreies JSON, MAC-keyed Merge) ────────────────────
+
+# Volle Spaltenliste der Tabelle (Reihenfolge = INSERT-Reihenfolge unten).
+WB_ALL_COLS = ("mac", "customer", "location", "device_name", "ip_mode", "ip",
+               "gateway", "subnet", "dns", "wifi_ssid", "wifi_password",
+               "buttons", "config_json", "ino", "first_seen", "last_flashed",
+               "flash_count", "notes")
+# Inhaltliche Felder für den Diff (ohne Zeitstempel/Zähler).
+WB_CONTENT_COLS = ("customer", "location", "device_name", "ip_mode", "ip",
+                   "gateway", "subnet", "dns", "wifi_ssid", "wifi_password",
+                   "buttons", "config_json", "ino", "notes")
+WB_EXPORT_FORMAT = "wifi-button-db"
+WB_EXPORT_VERSION = 1
+
+
+def wb_full_row(mac: str) -> dict | None:
+    """Full per-device record as a dict, keyed by MAC (None if unknown)."""
+    con = wb_db()
+    row = con.execute(
+        f"SELECT {', '.join(WB_ALL_COLS)} FROM wifi_buttons WHERE mac=?",
+        (mac.upper(),),
+    ).fetchone()
+    con.close()
+    return dict(zip(WB_ALL_COLS, row)) if row else None
+
+
+def wb_export_db(query: str = "") -> dict:
+    """Lossless export bundle of the (optionally filtered) devices."""
+    rows = wb_search(query) if query else wb_all()
+    devices = [wb_full_row(r[2]) for r in rows]  # r[2] == mac
+    return {
+        "format": WB_EXPORT_FORMAT,
+        "version": WB_EXPORT_VERSION,
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "devices": [d for d in devices if d],
+    }
+
+
+def _import_text(record: dict, col: str) -> str:
+    """Read a column from an import record, coercing JSON fields to strings."""
+    val = record.get(col, "")
+    if col in ("buttons", "config_json") and not isinstance(val, str):
+        return json.dumps(val, ensure_ascii=False)
+    return "" if val is None else str(val)
+
+
+def wb_diff_record(record: dict) -> str:
+    """Classify an import record against the current DB: new|changed|same."""
+    mac = (record.get("mac") or "").upper()
+    existing = wb_full_row(mac) if mac else None
+    if existing is None:
+        return "new"
+    for col in WB_CONTENT_COLS:
+        if _import_text(record, col) != ("" if existing[col] is None
+                                         else str(existing[col])):
+            return "changed"
+    return "same"
+
+
+def wb_import_records(records: list[dict],
+                      selected_macs: set[str]) -> tuple[int, int]:
+    """Merge-upsert selected records. Returns (added, updated).
+
+    On conflict the incoming content overwrites, but first_seen and the higher
+    flash_count are kept so local history survives. Records without a MAC are
+    skipped."""
+    selected = {m.upper() for m in selected_macs}
+    added = updated = 0
+    con = wb_db()
+    now = datetime.now().isoformat(timespec="seconds")
+    for rec in records:
+        mac = (rec.get("mac") or "").upper()
+        if not mac or mac not in selected:
+            continue
+        exists = con.execute(
+            "SELECT 1 FROM wifi_buttons WHERE mac=?", (mac,)).fetchone()
+        vals = {c: _import_text(rec, c) for c in WB_CONTENT_COLS}
+        first_seen = rec.get("first_seen") or now
+        last_flashed = rec.get("last_flashed") or now
+        flash_count = int(rec.get("flash_count") or 0)
+        con.execute(
+            f"""
+            INSERT INTO wifi_buttons
+                ({', '.join(WB_ALL_COLS)})
+            VALUES ({', '.join('?' for _ in WB_ALL_COLS)})
+            ON CONFLICT(mac) DO UPDATE SET
+                {', '.join(f'{c}=excluded.{c}' for c in WB_CONTENT_COLS)},
+                last_flashed = MAX(COALESCE(wifi_buttons.last_flashed,''),
+                                   COALESCE(excluded.last_flashed,'')),
+                flash_count  = MAX(wifi_buttons.flash_count, excluded.flash_count)
+            """,
+            (mac, vals["customer"], vals["location"], vals["device_name"],
+             vals["ip_mode"], vals["ip"], vals["gateway"], vals["subnet"],
+             vals["dns"], vals["wifi_ssid"], vals["wifi_password"],
+             vals["buttons"], vals["config_json"], vals["ino"],
+             first_seen, last_flashed, flash_count, vals["notes"]),
+        )
+        if exists:
+            updated += 1
+        else:
+            added += 1
+    con.commit()
+    con.close()
+    return added, updated
+
+
 def wb_get_config(mac: str) -> dict | None:
     con = wb_db()
     row = con.execute(
@@ -1710,6 +1816,8 @@ class WifiButtonBuilder(tk.Tk):
         self.db_search_var = tk.StringVar()
         ttk.Entry(top, textvariable=self.db_search_var, width=22).pack(side="left", padx=(4, 6))
         ttk.Button(top, text="⬇ CSV", command=self._db_export_csv).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="⬇ DB", command=self._db_export_json).pack(side="left", padx=(4, 0))
+        ttk.Button(top, text="⬆ Import…", command=self._db_import).pack(side="left", padx=(4, 0))
         self.db_search_var.trace_add("write", lambda *a: self._db_refresh())
 
         cols = ("customer", "location", "mac", "device_name", "ip", "buttons", "count")
@@ -1910,6 +2018,135 @@ class WifiButtonBuilder(tk.Tk):
             wr.writerow(WB_EXPORT_COLS)
             wr.writerows(rows)
         messagebox.showinfo("Exportiert", f"CSV gespeichert:\n{path}")
+
+    def _db_export_json(self):
+        """Lossless JSON export of the filtered devices (for technician → merge)."""
+        bundle = wb_export_db(self.db_search_var.get().strip())
+        if not bundle["devices"]:
+            messagebox.showinfo("Leer", "Keine Daten zum Exportieren.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".wbdb.json",
+            filetypes=[("WiFi-Button DB", "*.wbdb.json"),
+                       ("JSON", "*.json"), ("All files", "*.*")],
+            initialfile=f"wifi-buttons_{datetime.now():%Y%m%d}.wbdb.json")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(bundle, fh, ensure_ascii=False, indent=2)
+        messagebox.showinfo(
+            "Exportiert",
+            f"{len(bundle['devices'])} Geräte gespeichert:\n{path}")
+
+    def _db_import(self):
+        """Pick a *.wbdb.json file, classify against the DB, show preview."""
+        path = filedialog.askopenfilename(
+            filetypes=[("WiFi-Button DB", "*.wbdb.json"),
+                       ("JSON", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                bundle = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            messagebox.showerror("Fehler", f"Datei nicht lesbar:\n{e}")
+            return
+        if not isinstance(bundle, dict) or bundle.get("format") != WB_EXPORT_FORMAT:
+            messagebox.showerror("Falsches Format",
+                                 "Das ist keine WiFi-Button-DB-Exportdatei.")
+            return
+        items, skipped = [], 0
+        for rec in bundle.get("devices") or []:
+            if not (rec.get("mac") or "").strip():
+                skipped += 1
+                continue
+            items.append((wb_diff_record(rec), rec))
+        if not items:
+            messagebox.showinfo("Nichts zu importieren",
+                                "Keine gültigen Geräte in der Datei.")
+            return
+        self._show_import_preview(items, skipped)
+
+    def _show_import_preview(self, items, skipped):
+        """Modal preview: tick which devices to merge (new/changed pre-ticked)."""
+        win = tk.Toplevel(self)
+        win.title("Import — Vorschau")
+        win.geometry("700x470")
+        win.transient(self)
+        win.grab_set()
+
+        ttk.Label(
+            win, wraplength=670, foreground="gray",
+            text=("Klick auf eine Zeile schaltet das Häkchen um. Konflikte "
+                  "(ÄNDERT) überschreiben deine Version; first_seen und der "
+                  "höhere Flash-Zähler bleiben erhalten."),
+        ).pack(anchor="w", padx=8, pady=(8, 4))
+
+        cols = ("sel", "status", "mac", "device", "where")
+        tree = ttk.Treeview(win, columns=cols, show="headings", selectmode="none")
+        for c, h, wdt in (("sel", "✓", 34), ("status", "Status", 80),
+                          ("mac", "MAC", 150), ("device", "Gerät", 130),
+                          ("where", "Kunde/Standort", 200)):
+            tree.heading(c, text=h)
+            tree.column(c, width=wdt, anchor="w")
+        sy = ttk.Scrollbar(win, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sy.set)
+        sy.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True, padx=8)
+
+        labels = {"new": "NEU", "changed": "ÄNDERT", "same": "IDENTISCH"}
+        checked, rec_by_iid = {}, {}
+        for status, rec in items:
+            on = status in ("new", "changed")
+            where = " / ".join(x for x in (rec.get("customer", ""),
+                                           rec.get("location", "")) if x)
+            iid = tree.insert("", "end", values=(
+                "☑" if on else "☐", labels[status], rec["mac"].upper(),
+                rec.get("device_name", ""), where))
+            checked[iid] = on
+            rec_by_iid[iid] = rec
+
+        import_btn = ttk.Button(win, text="Importieren")
+
+        def update_btn():
+            n = sum(1 for v in checked.values() if v)
+            import_btn.configure(text=f"Importieren ({n})",
+                                 state="normal" if n else "disabled")
+
+        def toggle(event):
+            iid = tree.identify_row(event.y)
+            if not iid or tree.identify_region(event.x, event.y) != "cell":
+                return
+            checked[iid] = not checked[iid]
+            vals = list(tree.item(iid, "values"))
+            vals[0] = "☑" if checked[iid] else "☐"
+            tree.item(iid, values=vals)
+            update_btn()
+        tree.bind("<Button-1>", toggle)
+
+        def do_import():
+            sel = {rec_by_iid[i]["mac"].upper()
+                   for i, on in checked.items() if on}
+            records = list(rec_by_iid.values())
+            added, updated = wb_import_records(records, sel)
+            win.destroy()
+            if added or updated:
+                wb_git_push(f"import: {added} neu, {updated} aktualisiert")
+                self._db_refresh()
+                self._refresh_db_dropdowns()
+            messagebox.showinfo("Importiert",
+                                f"{added} neu, {updated} aktualisiert.")
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=8, pady=8)
+        note = f"  ({skipped} ohne MAC übersprungen)" if skipped else ""
+        ttk.Label(bar, text=f"{len(items)} Geräte{note}",
+                  foreground="gray").pack(side="left")
+        import_btn.configure(command=do_import)
+        import_btn.pack(in_=bar, side="right")
+        ttk.Button(bar, text="Abbrechen", command=win.destroy).pack(
+            side="right", padx=(0, 6))
+        update_btn()
 
 
 if __name__ == "__main__":
