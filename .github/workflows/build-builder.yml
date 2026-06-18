@@ -58,9 +58,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyserial pyinstaller
 
-      - name: Build Windows .exe
+      - name: Build Windows app (one-folder)
         if: runner.os == 'Windows'
-        run: pyinstaller --noconfirm --clean --windowed --onefile --name "WiFi Button Builder" wifi_button_builder.py
+        # One-folder statt one-file: ohne selbst-entpackenden Bootloader gibt es
+        # deutlich seltener den Defender-False-Positive (Wacatac.B!ml). Der Ordner
+        # wird als ZIP verteilt.
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir --name "WiFi Button Builder" wifi_button_builder.py
+          Compress-Archive -Path "dist/WiFi Button Builder" -DestinationPath "dist/WiFi Button Builder-Windows.zip"
 
       - name: Build macOS .app
         if: runner.os == 'macOS'
@@ -74,7 +79,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: WiFi-Button-Builder-Windows
-          path: wifi-button-builder/dist/WiFi Button Builder.exe
+          path: wifi-button-builder/dist/WiFi Button Builder-Windows.zip
 
       - name: Upload macOS artifact
         if: runner.os == 'macOS'
@@ -83,11 +88,11 @@ jobs:
           name: WiFi-Button-Builder-macOS
           path: wifi-button-builder/dist/WiFi Button Builder-macOS.zip
 
-      - name: Attach Windows .exe to release
+      - name: Attach Windows ZIP to release
         if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: wifi-button-builder/dist/WiFi Button Builder.exe
+          files: wifi-button-builder/dist/WiFi Button Builder-Windows.zip
 
       - name: Attach macOS .app to release
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
