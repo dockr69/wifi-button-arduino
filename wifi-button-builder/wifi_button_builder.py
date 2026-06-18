@@ -30,6 +30,11 @@ from pathlib import Path
 # serial number, so we can read it without any firmware running.
 MAC_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 
+# Windows: stop each child process (arduino-cli, git) from flashing a console
+# window — the GUI is windowed but the 5s board-list poller would otherwise pop
+# a cmd window constantly. CREATE_NO_WINDOW exists only on Windows; 0 elsewhere.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
@@ -485,7 +490,8 @@ def wb_git_pull() -> None:
         subprocess.run(
             ["git", "-C", str(DB_GIT_DIR), "pull", "--rebase",
              "--autostash", "--quiet"],
-            check=False, timeout=15, capture_output=True)
+            check=False, timeout=15, capture_output=True,
+            creationflags=_NO_WINDOW)
     except Exception:
         pass
 
@@ -499,24 +505,24 @@ def wb_git_push(message: str) -> None:
         try:
             r = subprocess.run(
                 ["git", "-C", str(DB_GIT_DIR), "add", str(DB_PATH)],
-                capture_output=True, timeout=10)
+                capture_output=True, timeout=10, creationflags=_NO_WINDOW)
             if r.returncode != 0:
                 return
             r = subprocess.run(
                 ["git", "-C", str(DB_GIT_DIR), "diff", "--cached", "--quiet"],
-                capture_output=True)
+                capture_output=True, creationflags=_NO_WINDOW)
             if r.returncode == 0:
                 return  # nothing staged
             subprocess.run(
                 ["git", "-C", str(DB_GIT_DIR), "commit", "-m", message],
-                capture_output=True, timeout=10)
+                capture_output=True, timeout=10, creationflags=_NO_WINDOW)
             subprocess.run(
                 ["git", "-C", str(DB_GIT_DIR), "pull", "--rebase",
                  "--autostash", "--quiet"],
-                capture_output=True, timeout=15)
+                capture_output=True, timeout=15, creationflags=_NO_WINDOW)
             subprocess.run(
                 ["git", "-C", str(DB_GIT_DIR), "push", "--quiet"],
-                capture_output=True, timeout=20)
+                capture_output=True, timeout=20, creationflags=_NO_WINDOW)
         except Exception:
             pass
 
@@ -606,6 +612,7 @@ def run_cli(args: list[str], log_cb) -> int:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        creationflags=_NO_WINDOW,
     )
     for line in proc.stdout:
         log_cb(line.rstrip())
@@ -620,7 +627,7 @@ def ensure_esp32_core(log_cb) -> bool:
     try:
         out = subprocess.check_output(
             _cli_base_args() + ["core", "list", "--format", "json"],
-            text=True, stderr=subprocess.STDOUT,
+            text=True, stderr=subprocess.STDOUT, creationflags=_NO_WINDOW,
         )
         data = json.loads(out)
         platforms = data.get("platforms", []) if isinstance(data, dict) else data
@@ -648,6 +655,7 @@ def _detected_ports() -> list[dict]:
         out = subprocess.check_output(
             _cli_base_args() + ["board", "list", "--format", "json"],
             text=True, stderr=subprocess.STDOUT, timeout=10,
+            creationflags=_NO_WINDOW,
         )
         data = json.loads(out)
         ports = data.get("detected_ports", []) if isinstance(data, dict) else data
