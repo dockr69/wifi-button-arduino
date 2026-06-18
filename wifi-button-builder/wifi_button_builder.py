@@ -109,7 +109,12 @@ if PTOUCH_DIR.is_dir():
     DB_PATH = PTOUCH_DIR / "labels.db"
     DB_GIT_DIR: Path | None = PTOUCH_DIR
 else:
-    DB_PATH = SCRIPT_DIR / "buttons.db"
+    # Stable per-user location so the fallback DB survives across runs. With a
+    # packaged (PyInstaller onefile) build SCRIPT_DIR is a temp extraction dir,
+    # so a buttons.db next to it would be ephemeral — keep it in the home dir.
+    APP_DATA_DIR = Path.home() / ".wifi_button_builder"
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DB_PATH = APP_DATA_DIR / "buttons.db"
     DB_GIT_DIR = None
 
 WB_SCHEMA = """
