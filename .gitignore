@@ -5,6 +5,12 @@
 __pycache__/
 *.pyc
 venv/
+.venv/
+
+# PyInstaller build artifacts (wifi-button-builder)
+build/
+dist/
+*.spec
 
 # ESPHome secrets
 secrets.yaml
