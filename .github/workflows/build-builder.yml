@@ -1,8 +1,9 @@
 name: Build WiFi Button Builder
 
-# Baut die GUI als Windows-.exe und macOS-.app.
+# Baut die GUI als Windows-.exe (One-Folder-ZIP).
 # - Manuell startbar (workflow_dispatch)
-# - Bei einem Tag v* entsteht zusätzlich ein GitHub Release mit beiden Artefakten.
+# - Bei einem Tag v* entsteht zusätzlich ein GitHub Release mit dem ZIP.
+# (macOS läuft direkt über die .py, daher kein .app-Build mehr.)
 on:
   workflow_dispatch:
   push:
@@ -38,11 +39,7 @@ jobs:
 
   build:
     needs: test
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     defaults:
       run:
         working-directory: wifi-button-builder
@@ -59,7 +56,6 @@ jobs:
           pip install pyserial pyinstaller
 
       - name: Build Windows app (one-folder)
-        if: runner.os == 'Windows'
         # One-folder statt one-file: ohne selbst-entpackenden Bootloader gibt es
         # deutlich seltener den Defender-False-Positive (Wacatac.B!ml). Der Ordner
         # wird als ZIP verteilt.
@@ -67,35 +63,14 @@ jobs:
           pyinstaller --noconfirm --clean --windowed --onedir --name "WiFi Button Builder" wifi_button_builder.py
           Compress-Archive -Path "dist/WiFi Button Builder" -DestinationPath "dist/WiFi Button Builder-Windows.zip"
 
-      - name: Build macOS .app
-        if: runner.os == 'macOS'
-        run: |
-          pyinstaller --noconfirm --clean --windowed --onefile --name "WiFi Button Builder" wifi_button_builder.py
-          # Eine .app ist ein Ordner -> für Artefakt/Release zippen.
-          cd dist && zip -r -y "WiFi Button Builder-macOS.zip" "WiFi Button Builder.app"
-
       - name: Upload Windows artifact
-        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: WiFi-Button-Builder-Windows
           path: wifi-button-builder/dist/WiFi Button Builder-Windows.zip
 
-      - name: Upload macOS artifact
-        if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
-        with:
-          name: WiFi-Button-Builder-macOS
-          path: wifi-button-builder/dist/WiFi Button Builder-macOS.zip
-
       - name: Attach Windows ZIP to release
-        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: wifi-button-builder/dist/WiFi Button Builder-Windows.zip
-
-      - name: Attach macOS .app to release
-        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: wifi-button-builder/dist/WiFi Button Builder-macOS.zip
