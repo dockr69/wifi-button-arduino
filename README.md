@@ -1,346 +1,285 @@
 # WiFi Button Builder – ESP32-C6
 
-A graphical tool for generating Arduino `.ino` sketches for battery-powered **WiFi buttons** based on the **Adafruit Feather ESP32-C6**. Configure buttons, HTTP endpoints, deep sleep behavior, and WiFi settings via a simple GUI — no manual coding required.
+A graphical tool to **configure battery-powered WiFi buttons** based on the
+**Adafruit Feather ESP32-C6**. Each button is a small device that, on a single
+press, wakes from deep sleep, connects to WiFi, fires one HTTP request, and goes
+back to sleep.
+
+The buttons run a generic **base image** that is flashed **once**. The builder
+does **not** compile or flash per device — it writes the configuration (WiFi,
+target URL, timing) into the button over **USB serial**, and can read it back.
+This makes it a fast field/bench tool for technicians: plug in, configure, done.
+
+> Need to build the base image or a one-off custom sketch? The builder can still
+> preview and export a complete Arduino `.ino` (see [Sketch export](#sketch-export-developers)).
 
 ---
 
-## Quick Start
+## Quick Start (technician)
 
-**macOS / Linux**
-```bash
-python wifi_button_builder.py
-```
+You only need the app and a **USB data cable** — no drivers, no Arduino IDE,
+no Python (on Windows).
 
 **Windows**
-```cmd
-python wifi_button_builder.py
-```
-
-> On Linux, Tkinter may need to be installed separately — see [Installation](#installation).
-
-1. Fill in WiFi credentials, static IP, and button URLs
-2. Click **Exportieren (.ino)** to save the sketch
-3. Open the `.ino` file in Arduino IDE and flash to the board
-
----
-
-## Features
-
-- GUI-based configuration (no code editing needed)
-- Generates complete Arduino sketches for ESP32-C6
-- Deep sleep with GPIO wakeup for minimal battery consumption
-- Multiple buttons, each with individual HTTP endpoint (GET/POST)
-- Static IP support (skips DHCP, saves ~1 s per wakeup)
-- Configurable WiFi TX power and power save mode
-- IO20 (STEMMA QT / NeoPixel power) always OFF + held during deep sleep
-- Save/load configurations as JSON
-
----
-
-## Requirements
-
-### Software
-- Python 3.10+
-- [Arduino IDE 2.x](https://www.arduino.cc/en/software)
-- ESP32 Arduino Core 3.x (via Arduino Board Manager)
-- Tkinter — included with standard Python on macOS and Windows; on Linux install separately (see below)
-
-### Hardware
-
-| Component | Details |
-|---|---|
-| Board | Adafruit Feather ESP32-C6 |
-| Framework | Arduino (ESP32 Arduino Core) |
-| Power | LiPo battery via JST connector |
-| Wakeup | Tactile button connected between a GPIO pin and GND |
-
----
-
-## Installation
-
-### 1. Install Python
+1. Download the latest `WiFi Button Builder-Windows.zip` from the
+   [Releases page](https://github.com/dockr69/wifi-button-arduino/releases),
+   unzip it, and run `WiFi Button Builder.exe`.
+2. Plug the button into USB. It appears automatically as a COM port — see
+   [USB & drivers](#usb--drivers).
+3. On the **Konfiguration** page fill in WiFi, the HTTP action (host + request),
+   then pick the port and click **⚡ Config senden**.
 
 **macOS**
-Python 3 is available via [python.org](https://www.python.org/downloads/) or Homebrew:
 ```bash
-brew install python
+cd wifi-button-builder
+python3 wifi_button_builder.py
 ```
+Same steps — the button shows up as `/dev/cu.usbmodem…` with no driver.
 
-**Windows**
-Download from [python.org](https://www.python.org/downloads/). During installation, check **Add Python to PATH**.
-
-**Linux (Ubuntu / Debian)**
-```bash
-sudo apt update
-sudo apt install python3 python3-pip python3-tk
-```
-
-**Linux (Fedora / RHEL)**
-```bash
-sudo dnf install python3 python3-pip python3-tkinter
-```
-
-**Linux (Arch)**
-```bash
-sudo pacman -S python python-pip tk
-```
-
-### 2. Clone and run the builder
-
-**macOS / Linux**
-```bash
-git clone https://github.com/dockr69/wifi-button-esphome.git
-cd wifi-button-esphome
-python wifi_button_builder.py
-```
-
-**Windows**
-```cmd
-git clone https://github.com/dockr69/wifi-button-esphome.git
-cd wifi-button-esphome
-python wifi_button_builder.py
-```
-
-### 3. Install the ESP32 board in Arduino IDE
-
-1. Open Arduino IDE → **File → Preferences**
-2. Add this URL to **Additional boards manager URLs**:
-   ```
-   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-   ```
-3. Go to **Tools → Board → Boards Manager**, search for **esp32** by Espressif, install version **3.x**
-4. Select **Tools → Board → ESP32 Arduino → Adafruit Feather ESP32-C6**
-
-### 4. Serial port permissions (Linux only)
-
-On Linux the serial port requires group access. Add your user to the `dialout` group, then log out and back in:
-
-```bash
-sudo usermod -aG dialout $USER
-```
-
-Verify with `ls -l /dev/ttyUSB*` or `ls -l /dev/ttyACM*` after plugging in the board.
+> The header shows a live indicator: **● Verbunden** (teal) when a button is
+> plugged in, **○ Kein Taster verbunden** otherwise.
 
 ---
 
-## Hardware Wiring
+## How it works
 
-Connect a momentary push button between your chosen GPIO pin and **GND**:
+```
+        ┌─────────────────┐   USB serial (SET/SAVE)   ┌──────────────────┐
+        │  WiFi Button     │ ────────────────────────► │  Feather ESP32-C6 │
+        │  Builder (GUI)   │ ◄──────────────────────── │  + base image     │
+        └─────────────────┘   USB serial (CFG?)        └──────────────────┘
+```
+
+- The **base image** (`firmware/wifi-button-base/`) is a generic firmware flashed
+  once per board. While on USB it boots into a **config mode** and listens on a
+  simple serial protocol.
+- The builder writes settings into the board's NVS via `SET …` / `SAVE`, and
+  reads the current config back via `CFG?` (the **📥 Auslesen** button).
+- On battery the board sleeps; a button press wakes it, it sends the configured
+  HTTP request, and it sleeps again.
+
+No per-device compiling or flashing is involved in normal use.
+
+---
+
+## The interface
+
+The app has two pages, switched via the segmented control in the header:
+
+### Konfiguration
+
+| Card | Contents |
+|---|---|
+| **Gerät** | Device name, MAC (auto-filled from the connected board), Kunde, Standort |
+| **WiFi** | SSID, password, IP mode (`Statisch` / `DHCP + IP-Cache`), IP/Gateway/Subnet/DNS, TX power, power save |
+| **Timing & Wiederholung** | WiFi/HTTP timeout, cooldown, number of sends, repeat interval |
+| **HTTP Aktion** | The single action this button triggers (see below) |
+| **Taster (USB-Serial)** | Port selector, **⚡ Config senden**, **📥 Auslesen** |
+
+Footer: **Vorschau** / **Export .ino** (sketch), **Config laden** / **Config
+speichern** (JSON), **In DB speichern**.
+
+### Datenbank
+
+A shared device database (keyed by MAC) listing every configured button —
+Kunde, Standort, MAC, device name, IP and **Request**. Click a row to load that
+device into the editor. Search, CSV/JSON export and import are available. The DB
+is shared with the label-printing tool (ptouch) via `labels.db`.
+
+---
+
+## HTTP action
+
+Every button sends exactly **one** request, with a fixed URL shape:
+
+```
+http://<host>/cgi-bin/index.cgi?webif-pass=<pass>&spotrequest=<request>
+```
+
+In the editor you only set three fields — **Host (IP)**, **WebIF-Pass** and
+**Spot-Request**. The path is fixed (`/cgi-bin/index.cgi`) and the method is
+always **GET**. The full URL is what gets stored; for devices configured before
+this layout, the three fields are parsed back out of the stored URL.
+
+---
+
+## USB & drivers
+
+**No driver installation is required.** The Feather ESP32-C6 uses the chip's
+**native USB-Serial-JTAG** (the base image is built with `CDCOnBoot=cdc`), so the
+board enumerates as a standard **USB CDC serial** device:
+
+| OS | Result |
+|---|---|
+| Windows 10 / 11 | In-box `usbser.sys` driver → appears automatically as `COM3`, `COM4`, … |
+| macOS | Appears as `/dev/cu.usbmodem…` |
+| Linux | Appears as `/dev/ttyACM0` (add your user to the `dialout` group) |
+
+> **Not** a CP210x/CH340 board — do not install those drivers. The only common
+> pitfall is a **charge-only USB cable**; use a data cable. The base MAC is read
+> straight from the USB serial number, so the port and MAC show up even before
+> any firmware logic runs.
+
+---
+
+## Installation (running from source / development)
+
+Only needed on macOS/Linux, or for development. On Windows use the released
+`.exe` instead.
+
+### 1. Python + Tkinter + pyserial
+
+- **macOS:** `brew install python` (Tkinter included)
+- **Linux (Debian/Ubuntu):** `sudo apt install python3 python3-pip python3-tk`
+- **Linux (Fedora):** `sudo dnf install python3 python3-pip python3-tkinter`
+
+```bash
+git clone https://github.com/dockr69/wifi-button-arduino.git
+cd wifi-button-arduino/wifi-button-builder
+python3 -m venv .venv && . .venv/bin/activate
+pip install pyserial
+python3 wifi_button_builder.py
+```
+
+### 2. Linux serial permissions
+
+```bash
+sudo usermod -aG dialout $USER   # then log out and back in
+```
+
+### 3. Building the Windows `.exe`
+
+Pushing a `v*` git tag triggers the GitHub Actions workflow
+(`.github/workflows/build-builder.yml`), which runs the tests and builds the
+Windows one-folder ZIP, attaching it to a GitHub Release. (macOS runs from the
+`.py`, so no `.app` is built.)
+
+---
+
+## Hardware wiring
+
+A momentary push button between GPIO **IO2** (Feather label **A5 / IO2**) and
+**GND** — this RTC-capable pin is fixed in the firmware:
 
 ```
 ESP32-C6                  Button
 ─────────                 ──────
-GPIO pin ──────────────── leg 1
-GND      ──────────────── leg 2
+IO2  ──────────────────── leg 1
+GND  ──────────────────── leg 2
 ```
 
-The generated sketch enables the internal pull-up resistor on the wakeup pin, so no external resistor is needed. The device wakes on a **LOW** signal (button press pulls the pin to GND) by default. This can be changed to HIGH in the GPIO section of the GUI.
-
-**Recommended pins** (RTC-capable, marked ★ in the GUI — these survive deep sleep):
-
-| Feather Label | GPIO |
-|---|---|
-| A5 / IO2 ★ | 2 (default) |
-| A0 / IO1 ★ | 1 |
-| A1 / IO4 ★ | 4 |
-| A2 / IO6 ★ | 6 |
-| A3 / IO5 ★ | 5 |
-| A4 / IO3 ★ | 3 |
-| IO0 ★ | 0 |
-| IO7 ★ | 7 |
-
-> Only RTC-capable GPIO pins (★) support GPIO wakeup from deep sleep. Non-RTC pins will not wake the device.
+The internal pull-up is enabled, so no external resistor is needed. The device
+wakes on a **LOW** signal (press pulls IO2 to GND). Power is a LiPo battery on
+the JST connector.
 
 ---
 
-## Usage
+## Firmware behavior
 
-### 1. Start the GUI
+These apply to the base image / generated sketch and don't need configuration.
 
-**macOS / Linux**
-```bash
-python wifi_button_builder.py
-```
-
-**Windows**
-```cmd
-python wifi_button_builder.py
-```
-
-The last-used configuration is restored automatically on startup.
-
-### 2. Configure the device
-
-**Device section**
-- Set a device name (used as the default filename when exporting).
-
-**WiFi section**
-- Enter your SSID and password.
-- Enable **Statische IP** and fill in IP, Gateway, Subnet, DNS to skip DHCP (~1 s faster connect).
-- Set **TX Power** (default 20 dBm for fastest association). Lower values save power but may slow connection.
-
-**GPIO section**
-- Select the **Wakeup Pin** from the Feather pin dropdown (★ = RTC-capable, required for deep sleep wakeup).
-- Set **Wakeup Level**: `LOW` for a button wired to GND (most common), `HIGH` for a button wired to VCC.
-
-**Timing section**
-
-| Setting | Default | Description |
-|---|---|---|
-| WiFi Timeout | 10000 ms | How long to wait for WiFi before giving up |
-| HTTP Timeout | 3000 ms | Timeout for the HTTP request |
-| Maintenance | 5000 ms | Stay-awake window after WiFi failure (for OTA/serial) |
-
-### 3. Add HTTP actions (buttons)
-
-Each entry in the **HTTP Aktionen** section corresponds to one HTTP request sent per button press:
-
-| Field | Description |
-|---|---|
-| Name | Label for this action (informational only) |
-| URL | Full URL to call, e.g. `http://192.168.1.10/webhook` |
-| Method | `GET` or `POST` |
-
-Click **+ Button hinzufügen** to add more actions. All configured actions are sent on every wakeup.
-
-### 4. Preview and export
-
-| Button | Action |
-|---|---|
-| Vorschau | Opens a window with the generated `.ino` code |
-| Exportieren (.ino) | Saves the sketch to a file |
-| Config speichern | Saves current settings as a JSON file |
-| Config laden | Loads settings from a JSON file |
-
-### 5. Flash to the board
-
-1. Open the exported `.ino` file in Arduino IDE
-2. Select **Tools → Board → Adafruit Feather ESP32-C6**
-3. Select the correct port under **Tools → Port**:
-   - **macOS:** `/dev/cu.usbmodem…` or `/dev/cu.SLAB_USBtoUART`
-   - **Windows:** `COM3`, `COM4`, etc. (check Device Manager)
-   - **Linux:** `/dev/ttyUSB0` or `/dev/ttyACM0`
-4. Click **Upload** (`Ctrl+U` / `⌘U`)
-
-> **First upload:** if the board is not detected, hold the **BOOT** button while pressing **RESET** to enter download mode, then try again.
-
-Open **Tools → Serial Monitor** at **115200 baud** to watch the connection log.
-
----
-
-## Configuration Options
-
-| Setting | Default | Description |
-|---|---|---|
-| `device_name` | `wifi-button` | Used as default export filename |
-| `wifi_ssid` / `wifi_password` | — | WiFi credentials |
-| `use_static_ip` | `true` | Skip DHCP for faster connect |
-| `static_ip` / `gateway` / `subnet` / `dns` | — | Static network config |
-| `wakeup_pin` | 2 | GPIO pin that wakes the device (must be RTC-capable) |
-| `wakeup_level` | `LOW` | Signal level that triggers wakeup |
-| `wifi_timeout_ms` | 10000 | WiFi connect timeout in ms |
-| `http_timeout_ms` | 3000 | HTTP request timeout in ms |
-| `maintenance_ms` | 5000 | Stay-awake time after WiFi failure |
-| `wifi_tx_power` | `20dBm` | TX power level (2–20 dBm) |
-| `wifi_power_save` | `false` | Enable WiFi power save mode |
-
----
-
-## Project Files
+### Wake-up flow
 
 ```
-wifi_button_builder.py          # Main GUI application
-wifi-button.yaml                # ESPHome config (alternative for development)
-wifi-button.json                # Example saved configuration
-wifi-button-arduino/
-  wifi-button-arduino.ino       # Example generated Arduino sketch
+Wake (IO2 LOW)
+  ├─ IO20 (STEMMA QT / NeoPixel) → OFF + hold
+  ├─ WiFi config: static IP / cached DHCP, TX power, power save
+  ├─ RTC cache present? ──Yes──► WiFi.begin(SSID, PW, channel, BSSID)  ← skips scan
+  │        └─No──► full scan
+  ├─ Connected → save channel + BSSID to RTC → send HTTP request(s) → deep sleep
+  └─ Timeout   → clear RTC cache → short stay-awake → deep sleep
 ```
 
----
-
-## Connection & Wake-up Flow
-
-Every button press triggers a full boot from deep sleep. The sketch minimizes the time from wake-up to HTTP request:
-
-```
-Wake (GPIO LOW)
-  │
-  ├─ IO20 (STEMMA QT / NeoPixel) → OFF + hold (before anything else)
-  ├─ Check wakeup cause (GPIO / other)
-  │
-  ├─ WiFi config: static IP, TX power, no power save
-  │
-  ├─ RTC cache available? ──Yes──► WiFi.begin(SSID, PW, channel, BSSID)  ← skips scan
-  │         │                                │
-  │         No                         connected < 4s?
-  │         │                                │
-  │         └──► full scan              No → fallback to full scan, clear cache
-  │
-  ├─ Connected → save channel + BSSID to RTC memory
-  │            → send HTTP request(s)
-  │            → deep sleep
-  │
-  └─ Timeout  → clear RTC cache
-               → maintenance window (5 s for OTA/serial)
-               → deep sleep
-```
-
----
-
-## WiFi Speed Optimizations
+### WiFi speed optimizations
 
 | Technique | Time saved |
 |---|---|
 | Static IP (no DHCP) | ~1000 ms |
 | RTC cache: BSSID + channel (skips AP scan) | ~300–500 ms |
-| Max TX power (19.5 dBm) | faster association |
+| Max TX power | faster association |
 | `WiFi.persistent(false)` | no flash write on connect |
 | `WIFI_FAST_SCAN` | stops after first matching AP |
 
-### RTC Memory Cache
+Channel + BSSID are stored in `RTC_DATA_ATTR` memory (survives deep sleep). A
+cached connect that fails within ~4 s falls back to a full scan and resets the
+cache.
 
-The generated sketch stores WiFi channel and BSSID in **RTC memory** (`RTC_DATA_ATTR`), which survives deep sleep. On the next wakeup the device connects directly to the known AP without scanning:
+### Fire-and-forget HTTP
 
-```cpp
-RTC_DATA_ATTR int     savedChannel = 0;
-RTC_DATA_ATTR uint8_t savedBSSID[6] = {0};
-RTC_DATA_ATTR bool    hasCachedWiFi = false;
+A raw `WiFiClient` sends the request and disconnects without waiting for the full
+response, shaving ~100–200 ms off uptime.
+
+### IO20 power
+
+IO20 (STEMMA QT / NeoPixel power) is driven LOW and `gpio_hold_en()`-held before
+deep sleep to stop leakage current. Always applied.
+
+### Cooldown, repeat & maintenance
+
+- **Cooldown:** presses within *N* seconds of the last send are ignored
+  (`cooldown_s`, 0 = off); survives deep sleep via RTC timekeeping.
+- **Repeat:** the batch is sent `repeat_count` times with `repeat_interval_s`
+  between sends (1 = single shot); a press during the sequence cancels it.
+- **Maintenance:** hold the button ~5 s to keep the board awake for reflashing.
+
+---
+
+## Serial config protocol (base image)
+
+While on USB the base image accepts line commands at **115200 baud**:
+
+| Command | Meaning |
+|---|---|
+| `VER?` | `VER wbtn <fw>` — identify the base image |
+| `MAC?` | report the base MAC |
+| `CFG?` | dump the current config (ends with `END`) — used by **Auslesen** |
+| `SET <key> <value>` | stage a value into NVS |
+| `SAVE` | commit staged values → `OK saved` |
+| `CLEAR` | wipe stored config |
+| `RUN` | leave config mode |
+
+---
+
+## Configuration options
+
+| Setting | Default | Description |
+|---|---|---|
+| `device_name` | `wifi-button` | Default export filename |
+| `customer` / `location` | — | Site metadata (drives DB sorting) |
+| `wifi_ssid` / `wifi_password` | — | WiFi credentials (the password is never read back by `CFG?`) |
+| `ip_mode` | `static` | `static` (no DHCP) or `dhcp_cache` (DHCP once, cache lease in RTC) |
+| `static_ip` / `gateway` / `subnet` / `dns` | — | Static network config |
+| `wifi_timeout_s` | 10 | WiFi connect timeout |
+| `http_timeout_s` | 3 | HTTP request timeout |
+| `cooldown_s` | 30 | Ignore presses within N s of last send (0 = off) |
+| `wifi_tx_power` | `20dBm` | TX power level |
+| `wifi_power_save` | `false` | WiFi power save mode |
+| `repeat_count` | 1 | Number of sends per press (1 = single) |
+| `repeat_interval_s` | 60 | Delay between repeated sends |
+| `buttons` | — | The action (host / webif-pass / spotrequest, stored as a URL) |
+
+---
+
+## Sketch export (developers)
+
+The builder can still generate a standalone Arduino sketch from the current
+config: **Vorschau** previews it, **Export .ino** saves it. To compile/flash it
+you need Arduino IDE 2.x with the **ESP32 Arduino Core 3.x** (board: *Adafruit
+Feather ESP32-C6*, **USB CDC On Boot = Enabled**). This is only needed to build
+the base image or experiment — normal configuration uses serial config instead.
+
+---
+
+## Project structure
+
 ```
-
-If the cached connect fails after 4 seconds (AP rebooted, channel changed), it automatically falls back to a full scan and resets the cache.
-
----
-
-## HTTP Fire-and-Forget
-
-The generated sketch uses a raw `WiFiClient` instead of `HTTPClient`. It sends the HTTP request and immediately disconnects without waiting for the full response — reducing uptime by ~100–200 ms:
-
+wifi-button-builder/
+  wifi_button_builder.py        # the GUI app
+  tests/                        # pytest (DB I/O, URL parsing, port detection)
+firmware/wifi-button-base/      # generic base image (.ino + prebuilt .bin)
+wifi-button-arduino/            # example generated sketch
+.github/workflows/              # CI: tests + Windows .exe on v* tags
 ```
-client.connect(host, port)
-  → send GET/POST request
-  → flush + disconnect
-  → enter deep sleep
-```
-
----
-
-## IO20 – STEMMA QT / NeoPixel Power
-
-IO20 is always driven LOW and held via `gpio_hold_en()` before entering deep sleep. This cuts power to the onboard STEMMA QT connector and NeoPixel, preventing leakage current while the chip sleeps. No configuration needed — this is always applied.
-
----
-
-## Maintenance Window
-
-If WiFi fails, the device stays awake for `MAINTENANCE_MS` (default 5 s) before sleeping again. This allows serial debugging or OTA updates even when the network is unreachable. Reduce this value to save battery in deployed devices.
-
----
-
-## ESPHome Alternative
-
-`wifi-button.yaml` provides an ESPHome-based alternative — useful for OTA updates and remote logging without reflashing via USB.
-
-> Add your WiFi credentials to `secrets.yaml` and reference them via `!secret` instead of hardcoding them in the YAML.
 
 ---
 
@@ -348,13 +287,12 @@ If WiFi fails, the device stays awake for `MAINTENANCE_MS` (default 5 s) before 
 
 | Problem | Platform | Solution |
 |---|---|---|
-| Board not detected in Arduino IDE | All | Hold BOOT + press RESET to enter download mode |
-| No port visible in Arduino IDE | Windows | Install CP210x or CH340 USB driver for your board's USB chip |
-| No port visible in Arduino IDE | Linux | Run `sudo usermod -aG dialout $USER` and log out/in |
-| `No module named tkinter` | Linux | `sudo apt install python3-tk` (Debian/Ubuntu) or `sudo dnf install python3-tkinter` (Fedora) |
-| WiFi connect timeout | All | Check SSID/password; try disabling static IP; lower TX power if signal is saturated |
-| HTTP request fails | All | Verify the server IP and port; check firewall rules |
-| Device does not wake on button press | All | Ensure the wakeup pin is RTC-capable (marked ★); check wiring |
-| Deep sleep current too high | All | Verify IO20 is held LOW; check no other GPIO is floating |
-| Sketch compiles but immediately crashes | All | Confirm board selection is **Adafruit Feather ESP32-C6** in Arduino IDE |
-| `python` not found | Windows | Use `py` instead of `python`, or re-install Python with "Add to PATH" checked |
+| Button not detected / no COM port | All | Use a **USB data cable** (not charge-only); re-plug. No driver is needed — it's native USB CDC. |
+| No port in the dropdown | Linux | `sudo usermod -aG dialout $USER`, then log out/in |
+| `✗ Keine Antwort vom Base-Image (VER?)` | All | Base image not flashed, or board not in config mode — re-plug USB / tap RESET |
+| `No module named tkinter` | Linux | `sudo apt install python3-tk` (Debian/Ubuntu) / `sudo dnf install python3-tkinter` (Fedora) |
+| WiFi connect timeout | All | Check SSID/password; verify the static IP fits the network |
+| HTTP request fails | All | Verify host/IP reachable; check firewall |
+| Device does not wake on press | All | Check button wiring between **IO2** and **GND** |
+| Deep sleep current too high | All | Ensure IO20 is held LOW; no other GPIO floating |
+| `python` not found | Windows | Use the released `.exe`, or `py` instead of `python` |
