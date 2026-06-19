@@ -135,6 +135,20 @@ def test_update_from_read_creates_record_for_unknown_mac(fresh_db):
     assert row["ip"] == "DHCP"
 
 
+def test_action_url_parse_compose_roundtrip():
+    u = "http://192.168.2.175/cgi-bin/index.cgi?webif-pass=1&spotrequest=test1.mp3"
+    assert w.parse_action_url(u) == ("192.168.2.175", "1", "test1.mp3")
+    assert w.compose_action_url("192.168.2.175", "1", "test1.mp3") == u
+    # Bestandsgerät / leere URL -> leere Felder, kein Crash.
+    assert w.parse_action_url("") == ("", "", "")
+    # Host mit Schema/Slash wird normalisiert; Werte werden URL-kodiert.
+    out = w.compose_action_url("http://10.0.0.5/", "p w", "a b.mp3")
+    assert out.startswith("http://10.0.0.5/cgi-bin/index.cgi?")
+    assert "webif-pass=p%20w" in out and "spotrequest=a%20b.mp3" in out
+    # … und lässt sich wieder sauber zurücklesen.
+    assert w.parse_action_url(out) == ("10.0.0.5", "p w", "a b.mp3")
+
+
 class _FakePort:
     def __init__(self, device, serial_number):
         self.device = device

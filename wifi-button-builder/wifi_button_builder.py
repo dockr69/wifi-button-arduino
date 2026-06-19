@@ -20,6 +20,7 @@ import time
 import queue
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit, parse_qsl, quote
 
 # ESP32-C6 (USB-Serial-JTAG) puts the base MAC into the USB descriptor
 # serial number, so we can read it without any firmware running.
@@ -797,6 +798,44 @@ def read_config_serial(port: str, log_cb) -> dict | None:
         return None
 
 
+# ── Aktions-URL (festes Schema) ───────────────────────────────────────────────
+#
+# Die Taster-Aktion hat immer dieselbe Form:
+#   http://<host>/cgi-bin/index.cgi?webif-pass=<pass>&spotrequest=<request>
+# Im Builder werden nur Host (IP), webif-pass und spotrequest editiert; Pfad und
+# Methode (GET) sind fix. Gespeichert wird weiterhin die volle URL — bei
+# Bestandsgeräten werden die drei Felder daraus zurückgelesen.
+ACTION_PATH = "/cgi-bin/index.cgi"
+ACTION_PASS_PARAM = "webif-pass"
+ACTION_REQUEST_PARAM = "spotrequest"
+
+
+def parse_action_url(url: str) -> tuple[str, str, str]:
+    """(host, webif-pass, spotrequest) aus einer Aktions-URL herauslösen.
+    Tolerant: was fehlt (oder eine abweichende Bestands-URL), wird ''."""
+    try:
+        parts = urlsplit(url or "")
+    except ValueError:
+        return "", "", ""
+    host = parts.netloc
+    if not host and parts.path:
+        # URL ohne Schema (z. B. blanke IP) -> ersten Pfadteil als Host nehmen.
+        host = parts.path.lstrip("/").split("/", 1)[0]
+    qs = dict(parse_qsl(parts.query, keep_blank_values=True))
+    return host, qs.get(ACTION_PASS_PARAM, ""), qs.get(ACTION_REQUEST_PARAM, "")
+
+
+def compose_action_url(host: str, webif_pass: str, request: str) -> str:
+    """Volle Aktions-URL aus den drei Feldern bauen (immer GET, fester Pfad)."""
+    host = (host or "").strip()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.strip("/")
+    return (f"http://{host}{ACTION_PATH}"
+            f"?{ACTION_PASS_PARAM}={quote(webif_pass.strip(), safe='')}"
+            f"&{ACTION_REQUEST_PARAM}={quote(request.strip(), safe='')}")
+
+
 # ── Code Generator ────────────────────────────────────────────────────────────
 
 
@@ -1116,40 +1155,39 @@ def generate_ino(cfg: dict) -> str:
 # ── GUI ───────────────────────────────────────────────────────────────────────
 
 
-class ButtonEditor(ttk.LabelFrame):
-    def __init__(self, parent, index, data, on_delete):
-        super().__init__(parent, text=f"Button {index + 1}", padding=6)
+class ButtonEditor(ttk.Frame):
+    # Es gibt immer genau einen Button — daher flach (kein eigener Rahmen, kein
+    # Entfernen/Hinzufügen) und ein Feld pro Zeile über die volle Breite, damit
+    # nichts am Kartenrand abgeschnitten wird.
+    def __init__(self, parent, index, data):
+        super().__init__(parent)
         self.index = index
-        self.on_delete = on_delete
-
-        row = 0
-        ttk.Label(self, text="Name:").grid(row=row, column=0, sticky="w")
-        self.name_var = tk.StringVar(value=data.get("name", f"Button {index + 1}"))
-        ttk.Entry(self, textvariable=self.name_var, width=30).grid(row=row, column=1, sticky="ew", padx=(4, 0))
-
-        row += 1
-        ttk.Label(self, text="URL:").grid(row=row, column=0, sticky="w")
-        self.url_var = tk.StringVar(value=data.get("url", ""))
-        ttk.Entry(self, textvariable=self.url_var, width=60).grid(row=row, column=1, columnspan=2, sticky="ew", padx=(4, 0))
-
-        row += 1
-        ttk.Label(self, text="Method:").grid(row=row, column=0, sticky="w")
-        self.method_var = tk.StringVar(value=data.get("method", "GET"))
-        ttk.Combobox(self, textvariable=self.method_var, values=["GET", "POST"], width=8, state="readonly").grid(
-            row=row, column=1, sticky="w", padx=(4, 0)
-        )
-        ttk.Button(self, text="✕ Entfernen", command=self._delete, width=14).grid(row=row, column=2, sticky="e", padx=(8, 0))
-
+        host, webif_pass, request = parse_action_url(data.get("url", ""))
         self.columnconfigure(1, weight=1)
 
-    def _delete(self):
-        self.on_delete(self.index)
+        rows = [
+            ("Name:",         "name_var",    data.get("name", "Button 1")),
+            ("Host (IP):",    "host_var",    host),
+            ("WebIF-Pass:",   "pass_var",    webif_pass),
+            ("Spot-Request:", "request_var", request),
+        ]
+        for r, (label, attr, value) in enumerate(rows):
+            ttk.Label(self, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            var = tk.StringVar(value=value)
+            setattr(self, attr, var)
+            ttk.Entry(self, textvariable=var).grid(
+                row=r, column=1, sticky="ew", padx=(4, 0), pady=2)
+
+        ttk.Label(self, text="Methode GET · Pfad /cgi-bin/index.cgi",
+                  style="Muted.TLabel").grid(row=len(rows), column=1, sticky="w",
+                                             padx=(4, 0), pady=(2, 0))
 
     def get_data(self) -> dict:
         return {
             "name": self.name_var.get(),
-            "url": self.url_var.get(),
-            "method": self.method_var.get(),
+            "url": compose_action_url(self.host_var.get(), self.pass_var.get(),
+                                      self.request_var.get()),
+            "method": "GET",
         }
 
 
@@ -1256,19 +1294,19 @@ class WifiButtonBuilder(tk.Tk):
         s.configure("TLabelframe.Label", background=C["bg"],
                     foreground=C["accent"], font=self.F["small_bold"])
         s.configure("TButton", background=C["bg"], foreground=C["ink"],
-                    borderwidth=1, relief="flat", padding=(12, 7),
+                    borderwidth=1, relief="flat", padding=(10, 5),
                     font=self.F["ui"], **flat)
         s.map("TButton",
               background=[("pressed", C["press"]), ("active", C["hover"])],
               bordercolor=[("active", C["accent"])])
         s.configure("Accent.TButton", background=C["accent"], foreground="#FFFFFF",
-                    padding=(14, 7), bordercolor=C["accent"],
+                    padding=(12, 5), bordercolor=C["accent"],
                     lightcolor=C["accent"], darkcolor=C["accent"])
         s.map("Accent.TButton",
               background=[("pressed", C["accent2"]), ("active", C["accent2"])],
               foreground=[("disabled", "#C7CBD1")])
         s.configure("TEntry", fieldbackground=C["bg"], foreground=C["ink"],
-                    borderwidth=1, padding=5, **flat)
+                    borderwidth=1, padding=3, **flat)
         s.map("TEntry", bordercolor=[("focus", C["accent"])])
         s.configure("TCombobox", fieldbackground=C["bg"], background=C["bg"],
                     foreground=C["ink"], arrowcolor=C["muted"], borderwidth=1,
@@ -1374,67 +1412,90 @@ class WifiButtonBuilder(tk.Tk):
         canvas.bind_all("<Button-4>", lambda e: self.view_var.get() == "editor" and canvas.yview_scroll(-1, "units"))
         canvas.bind_all("<Button-5>", lambda e: self.view_var.get() == "editor" and canvas.yview_scroll(1, "units"))
 
-        self._build_device_section()
-        self._build_wifi_section()
-        self._build_timing_section()
-        self._build_repeat_section()
-        self._build_buttons_section()
-        self._build_flash_section()
-        self._build_actions()
+        # Aligned dashboard grid. Gerät spans full width; below it two equal,
+        # flush card pairs — WiFi ↔ HTTP Aktionen and Timing&Wiederholung ↔
+        # Taster. sticky="nsew" + uniform columns make paired cards share the
+        # row's height, so their borders line up instead of ending ragged.
+        grid = ttk.Frame(self.scroll_frame)
+        grid.pack(fill="both", expand=True)
+        grid.columnconfigure(0, weight=1, uniform="c")
+        grid.columnconfigure(1, weight=1, uniform="c")
+
+        dev = ttk.Frame(grid)
+        dev.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self._build_device_section(dev)
+
+        wifi = ttk.Frame(grid)
+        wifi.grid(row=1, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
+        self._build_wifi_section(wifi)
+        http = ttk.Frame(grid)
+        http.grid(row=1, column=1, sticky="nsew", padx=(5, 0), pady=(0, 8))
+        self._build_buttons_section(http)
+
+        beh = ttk.Frame(grid)
+        beh.grid(row=2, column=0, sticky="nsew", padx=(0, 5))
+        self._build_timing_section(beh)
+        ser = ttk.Frame(grid)
+        ser.grid(row=2, column=1, sticky="nsew", padx=(5, 0))
+        self._build_flash_section(ser)
+
+        self._build_actions(self.scroll_frame)
 
         # Database page.
         self._build_db_panel(self.db_view)
 
         self._show_view("editor")
 
-    def _build_device_section(self):
-        f = ttk.LabelFrame(self.scroll_frame, text="Gerät (Adafruit Feather ESP32-C6)", padding=8)
-        f.pack(fill="x", pady=(0, 6))
+    def _build_device_section(self, parent):
+        f = ttk.LabelFrame(parent, text="Gerät (Adafruit Feather ESP32-C6)", padding=8)
+        f.pack(fill="both", expand=True)
 
-        ttk.Label(f, text="Device Name:").grid(row=0, column=0, sticky="w")
+        f.columnconfigure(1, weight=1)
+        f.columnconfigure(3, weight=1)
+
+        ttk.Label(f, text="Device Name:").grid(row=0, column=0, sticky="w", pady=2)
         self.device_name_var = tk.StringVar(value=self.config_data["device_name"])
-        ttk.Entry(f, textvariable=self.device_name_var, width=28).grid(row=0, column=1, sticky="w", padx=(4, 0))
+        ttk.Entry(f, textvariable=self.device_name_var).grid(
+            row=0, column=1, sticky="ew", padx=(4, 16), pady=2)
 
         # MAC: pick a connected board or an existing DB device. Choosing a
         # known MAC loads that device's full config into the editor.
-        ttk.Label(f, text="MAC:").grid(row=0, column=2, sticky="e", pady=(4, 0))
+        ttk.Label(f, text="MAC:").grid(row=0, column=2, sticky="w", pady=2)
         self.mac_var = tk.StringVar()
-        self.mac_combo = ttk.Combobox(f, textvariable=self.mac_var, width=24)
-        self.mac_combo.grid(row=0, column=3, sticky="w", padx=(4, 0), pady=(4, 0))
+        self.mac_combo = ttk.Combobox(f, textvariable=self.mac_var)
+        self.mac_combo.grid(row=0, column=3, sticky="ew", padx=(4, 0), pady=2)
         self.mac_combo.bind("<<ComboboxSelected>>", self._on_mac_selected)
 
-        ttk.Label(f, text="Kunde:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(f, text="Kunde:").grid(row=1, column=0, sticky="w", pady=2)
         self.customer_var = tk.StringVar(value=self.config_data.get("customer", ""))
-        self.customer_combo = ttk.Combobox(f, textvariable=self.customer_var, width=28)
-        self.customer_combo.grid(row=1, column=1, sticky="w", padx=(4, 0), pady=(4, 0))
+        self.customer_combo = ttk.Combobox(f, textvariable=self.customer_var)
+        self.customer_combo.grid(row=1, column=1, sticky="ew", padx=(4, 16), pady=2)
 
-        ttk.Label(f, text="Standort:").grid(row=1, column=2, sticky="e", pady=(4, 0))
+        ttk.Label(f, text="Standort:").grid(row=1, column=2, sticky="w", pady=2)
         self.location_var = tk.StringVar(value=self.config_data.get("location", ""))
-        self.location_combo = ttk.Combobox(f, textvariable=self.location_var, width=24)
-        self.location_combo.grid(row=1, column=3, sticky="w", padx=(4, 0), pady=(4, 0))
+        self.location_combo = ttk.Combobox(f, textvariable=self.location_var)
+        self.location_combo.grid(row=1, column=3, sticky="ew", padx=(4, 0), pady=2)
 
-    def _build_wifi_section(self):
-        f = ttk.LabelFrame(self.scroll_frame, text="WiFi", padding=8)
-        f.pack(fill="x", pady=(0, 6))
+    def _build_wifi_section(self, parent):
+        f = ttk.LabelFrame(parent, text="WiFi", padding=8)
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(1, weight=1)
+        f.columnconfigure(3, weight=1)
 
-        row = 0
-        ttk.Label(f, text="SSID:").grid(row=row, column=0, sticky="w")
+        ttk.Label(f, text="SSID:").grid(row=0, column=0, sticky="w", pady=2)
         self.ssid_var = tk.StringVar(value=self.config_data["wifi_ssid"])
-        ttk.Entry(f, textvariable=self.ssid_var, width=28).grid(row=row, column=1, sticky="w", padx=(4, 0))
-
-        ttk.Label(f, text="  Passwort:").grid(row=row, column=2, sticky="w")
+        ttk.Entry(f, textvariable=self.ssid_var).grid(
+            row=0, column=1, sticky="ew", padx=(4, 16), pady=2)
+        ttk.Label(f, text="Passwort:").grid(row=0, column=2, sticky="w", pady=2)
         self.pw_var = tk.StringVar(value=self.config_data["wifi_password"])
-        ttk.Entry(f, textvariable=self.pw_var, width=28).grid(row=row, column=3, sticky="w", padx=(4, 0))
+        ttk.Entry(f, textvariable=self.pw_var).grid(
+            row=0, column=3, sticky="ew", padx=(4, 0), pady=2)
 
-        row += 1
         self.ip_mode_var = tk.StringVar(value=self.config_data.get("ip_mode", "static"))
         mode_frame = ttk.Frame(f)
-        mode_frame.grid(row=row, column=0, columnspan=8, sticky="w", pady=(4, 0))
+        mode_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 2))
         ttk.Label(mode_frame, text="IP-Modus:").pack(side="left")
-        for label, val in [
-            ("Statisch",         "static"),
-            ("DHCP + IP-Cache",  "dhcp_cache"),
-        ]:
+        for label, val in [("Statisch", "static"), ("DHCP + IP-Cache", "dhcp_cache")]:
             ttk.Radiobutton(mode_frame, text=label, value=val,
                             variable=self.ip_mode_var,
                             command=self._on_ip_mode_change).pack(side="left", padx=(8, 0))
@@ -1446,26 +1507,26 @@ class WifiButtonBuilder(tk.Tk):
         self.ip_vars = {}
         self.ip_entries = {}
         for i, (label, key) in enumerate(labels):
-            r = row + 1 + (i // 2)
+            r = 2 + (i // 2)
             c = (i % 2) * 2
-            ttk.Label(f, text=label).grid(row=r, column=c, sticky="w", pady=(4, 0))
+            ttk.Label(f, text=label).grid(row=r, column=c, sticky="w", pady=2)
             var = tk.StringVar(value=self.config_data[key])
             self.ip_vars[key] = var
-            cb = ttk.Combobox(f, textvariable=var, width=18)
-            cb.grid(row=r, column=c + 1, sticky="w", padx=(4, 12), pady=(4, 0))
+            cb = ttk.Combobox(f, textvariable=var)
+            cb.grid(row=r, column=c + 1, sticky="ew",
+                    padx=(4, 16) if c == 0 else (4, 0), pady=2)
             self.ip_entries[key] = cb
-        row += 2
-        self._on_ip_mode_change()
 
-        row += 1
-        ttk.Label(f, text="TX Power:").grid(row=row, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(f, text="TX Power:").grid(row=4, column=0, sticky="w", pady=2)
         self.tx_power_var = tk.StringVar(value=self.config_data["wifi_tx_power"])
-        ttk.Combobox(f, textvariable=self.tx_power_var, values=list(TX_POWER_MAP.keys()), width=10, state="readonly").grid(
-            row=row, column=1, sticky="w", padx=(4, 0), pady=(4, 0)
-        )
-
+        ttk.Combobox(f, textvariable=self.tx_power_var, values=list(TX_POWER_MAP.keys()),
+                     width=10, state="readonly").grid(
+            row=4, column=1, sticky="w", padx=(4, 16), pady=2)
         self.power_save_var = tk.BooleanVar(value=self.config_data["wifi_power_save"])
-        ttk.Checkbutton(f, text="Power Save", variable=self.power_save_var).grid(row=row, column=2, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(f, text="Power Save", variable=self.power_save_var).grid(
+            row=4, column=2, columnspan=2, sticky="w", pady=2)
+
+        self._on_ip_mode_change()
 
     def _on_ip_mode_change(self):
         # Manual IP fields are only relevant in "static" mode
@@ -1473,107 +1534,93 @@ class WifiButtonBuilder(tk.Tk):
         for ent in self.ip_entries.values():
             ent.configure(state=state)
 
-    def _build_timing_section(self):
-        f = ttk.LabelFrame(self.scroll_frame, text="Timing (Sekunden)", padding=8)
-        f.pack(fill="x", pady=(0, 6))
+    def _build_timing_section(self, parent):
+        f = ttk.LabelFrame(parent, text="Timing & Wiederholung", padding=8)
+        f.pack(fill="both", expand=True)
 
-        self.timing_vars = {}
-        items = [
-            ("WiFi Timeout:", "wifi_timeout_s", 1, 120),
-            ("HTTP Timeout:", "http_timeout_s", 1, 120),
-            ("Cooldown:",     "cooldown_s",    0, 3600),
-        ]
-        for i, (label, key, lo, hi) in enumerate(items):
-            ttk.Label(f, text=label).grid(row=0, column=i * 2, sticky="w")
-            var = tk.IntVar(value=self.config_data[key])
-            self.timing_vars[key] = var
-            ttk.Spinbox(f, from_=lo, to=hi, increment=1, textvariable=var, width=6).grid(
-                row=0, column=i * 2 + 1, sticky="w", padx=(4, 12)
-            )
-        ttk.Label(f, text="Maintenance: Taste 5 s halten → bleibt 5 s wach zum Reflashen (fest).",
-                  foreground="gray").grid(row=1, column=0, columnspan=8, sticky="w", pady=(4, 0))
-        ttk.Label(f, text="Cooldown: kurze Tastendrücke innerhalb dieser Zeit nach dem letzten Send werden ignoriert (0 = aus). Langer Druck → Maintenance bleibt immer aktiv.",
-                  foreground="gray", wraplength=820).grid(row=2, column=0, columnspan=8, sticky="w", pady=(2, 0))
-
-    def _build_repeat_section(self):
-        f = ttk.LabelFrame(self.scroll_frame,
-                           text="Wiederholung (Tastendruck während Sequenz = Cancel)", padding=8)
-        f.pack(fill="x", pady=(0, 6))
-
-        ttk.Label(f, text="Anzahl Sends:").grid(row=0, column=0, sticky="w")
+        self.timing_vars = {
+            "wifi_timeout_s": tk.IntVar(value=self.config_data["wifi_timeout_s"]),
+            "http_timeout_s": tk.IntVar(value=self.config_data["http_timeout_s"]),
+            "cooldown_s":     tk.IntVar(value=self.config_data["cooldown_s"]),
+        }
         self.repeat_count_var = tk.IntVar(value=self.config_data.get("repeat_count", 1))
-        ttk.Spinbox(f, from_=1, to=20, textvariable=self.repeat_count_var, width=6).grid(
-            row=0, column=1, sticky="w", padx=(4, 12)
-        )
-
-        ttk.Label(f, text="Intervall (s):").grid(row=0, column=2, sticky="w")
         self.repeat_interval_var = tk.IntVar(value=self.config_data.get("repeat_interval_s", 60))
-        ttk.Spinbox(f, from_=1, to=3600, increment=1,
-                    textvariable=self.repeat_interval_var, width=8).grid(
-            row=0, column=3, sticky="w", padx=(4, 0)
-        )
+        f.columnconfigure(4, weight=1)  # trailing spacer → hint spans full width
 
-        ttk.Label(f, text="1 = einmaliger Send (kein Wiederholen).",
-                  foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        def spin(r, c, label, lo, hi, var, width=6):
+            ttk.Label(f, text=label).grid(row=r, column=c, sticky="w", pady=2)
+            ttk.Spinbox(f, from_=lo, to=hi, textvariable=var, width=width).grid(
+                row=r, column=c + 1, sticky="w", padx=(4, 18), pady=2)
 
-    def _build_flash_section(self):
-        f = ttk.LabelFrame(self.scroll_frame, text="Taster (USB-Serial)", padding=8)
-        f.pack(fill="x", pady=(0, 6))
+        spin(0, 0, "WiFi Timeout (s):", 1, 120, self.timing_vars["wifi_timeout_s"])
+        spin(0, 2, "HTTP Timeout (s):", 1, 120, self.timing_vars["http_timeout_s"])
+        spin(1, 0, "Cooldown (s):", 0, 3600, self.timing_vars["cooldown_s"])
+        spin(1, 2, "Anzahl Sends:", 1, 20, self.repeat_count_var)
+        spin(2, 0, "Intervall (s):", 1, 3600, self.repeat_interval_var, width=8)
+
+        ttk.Label(f, text="Cooldown: kurze Drücke nach dem Send ignorieren (0 = aus). "
+                          "Anzahl Sends 1 = einmalig. Maintenance: Taste 5 s halten.",
+                  style="Muted.TLabel", wraplength=340).grid(
+            row=3, column=0, columnspan=5, sticky="w", pady=(8, 0))
+
+    def _build_flash_section(self, parent):
+        f = ttk.LabelFrame(parent, text="Taster (USB-Serial)", padding=8)
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(1, weight=1)
 
         ttk.Label(f, text="Port:").grid(row=0, column=0, sticky="w")
         self.port_var = tk.StringVar()
-        self.port_combo = ttk.Combobox(f, textvariable=self.port_var, width=30, state="readonly")
-        self.port_combo.grid(row=0, column=1, sticky="w", padx=(4, 4))
+        self.port_combo = ttk.Combobox(f, textvariable=self.port_var, state="readonly")
+        self.port_combo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(4, 0))
 
-        self.flash_button = ttk.Button(f, text="⚡ Config senden",
+        btns = ttk.Frame(f)
+        btns.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.flash_button = ttk.Button(btns, text="⚡ Config senden",
                                        command=self._flash, style="Accent.TButton")
-        self.flash_button.grid(row=0, column=3, padx=(8, 0))
+        self.flash_button.pack(side="left")
+        ttk.Button(btns, text="📥 Auslesen", command=self._read_config,
+                   style="Accent.TButton").pack(side="left", padx=(6, 0))
 
-        ttk.Button(f, text="📥 Auslesen", command=self._read_config,
-                   style="Accent.TButton").grid(row=0, column=4, padx=(4, 0))
+        ttk.Label(f, text="Feather ESP32-C6 mit Base-Image · per USB anstecken (Config-Modus).",
+                  style="Muted.TLabel", wraplength=380).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-        ttk.Label(f, text="Adafruit Feather ESP32-C6 mit Base-Image · per USB anstecken (Config-Modus)",
-                  foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
-
-    def _build_buttons_section(self):
-        self.buttons_frame = ttk.LabelFrame(self.scroll_frame, text="HTTP Aktionen", padding=8)
-        self.buttons_frame.pack(fill="x", pady=(0, 6))
+    def _build_buttons_section(self, parent):
+        # Genau eine Aktion pro Taster → kein Hinzufügen/Entfernen.
+        self.buttons_frame = ttk.LabelFrame(parent, text="HTTP Aktion", padding=8)
+        self.buttons_frame.pack(fill="both", expand=True)
 
         self.btn_container = ttk.Frame(self.buttons_frame)
-        self.btn_container.pack(fill="x")
+        self.btn_container.pack(fill="both", expand=True)
 
-        ttk.Button(self.buttons_frame, text="+ Button hinzufügen", command=self._add_button).pack(anchor="w", pady=(6, 0))
-
-        for btn_data in self.config_data["buttons"]:
+        buttons = self.config_data.get("buttons") or [None]
+        for btn_data in buttons:
             self._add_button(btn_data)
 
     def _add_button(self, data=None):
         if data is None:
-            data = {"name": f"Button {len(self.button_editors) + 1}", "url": "", "method": "GET"}
-        idx = len(self.button_editors)
-        editor = ButtonEditor(self.btn_container, idx, data, self._remove_button)
-        editor.pack(fill="x", pady=(0, 4))
+            data = {"name": "Button 1", "url": "", "method": "GET"}
+        editor = ButtonEditor(self.btn_container, len(self.button_editors), data)
+        editor.pack(fill="x", pady=(0, 2))
         self.button_editors.append(editor)
 
-    def _remove_button(self, index):
-        if len(self.button_editors) <= 1:
-            messagebox.showwarning("Hinweis", "Mindestens ein Button muss vorhanden sein.")
-            return
-        editor = self.button_editors.pop(index)
-        editor.destroy()
-        for i, ed in enumerate(self.button_editors):
-            ed.index = i
-            ed.configure(text=f"Button {i + 1}")
+    def _build_actions(self, parent):
+        # Footer bar, anchored by a hairline so the buttons read as a toolbar and
+        # not as loose controls. Left = Sketch-Code, right = Konfiguration.
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=(2, 0))
+        bar = ttk.Frame(parent, padding=(0, 8))
+        bar.pack(fill="x")
 
-    def _build_actions(self):
-        f = ttk.Frame(self.scroll_frame, padding=(0, 6))
-        f.pack(fill="x")
+        sketch = ttk.Frame(bar)
+        sketch.pack(side="left")
+        ttk.Button(sketch, text="Vorschau", command=self._preview).pack(side="left")
+        ttk.Button(sketch, text="Export .ino", command=self._export).pack(side="left", padx=(6, 0))
 
-        ttk.Button(f, text="Vorschau", command=self._preview).pack(side="left", padx=(0, 6))
-        ttk.Button(f, text="Exportieren (.ino)", command=self._export).pack(side="left", padx=(0, 6))
-        ttk.Button(f, text="Config speichern", command=self._save_config).pack(side="left", padx=(0, 6))
-        ttk.Button(f, text="Config laden", command=self._load_config).pack(side="left", padx=(0, 6))
-        ttk.Button(f, text="In DB speichern…", command=self._save_to_db).pack(side="left", padx=(0, 6))
+        store = ttk.Frame(bar)
+        store.pack(side="right")
+        ttk.Button(store, text="Config laden", command=self._load_config).pack(side="left")
+        ttk.Button(store, text="Config speichern", command=self._save_config).pack(side="left", padx=(6, 0))
+        ttk.Button(store, text="In DB speichern", command=self._save_to_db).pack(side="left", padx=(6, 0))
 
     def _resolve_mac(self) -> str | None:
         """MAC for DB writes: the MAC field, else the connected board, else ask."""
@@ -1631,11 +1678,11 @@ class WifiButtonBuilder(tk.Tk):
                 except ValueError:
                     errors.append(f'{label} ist keine gültige IP-Adresse: "{cfg[key]}"')
         for i, btn in enumerate(cfg["buttons"], 1):
-            url = btn["url"].strip()
-            if not url:
-                errors.append(f"Button {i}: URL darf nicht leer sein.")
-            elif not re.match(r'https?://[^/:]+', url):
-                errors.append(f"Button {i}: URL muss mit http:// oder https:// beginnen.")
+            host, _pass, request = parse_action_url(btn.get("url", ""))
+            if not host.strip():
+                errors.append(f"Button {i}: Host (IP) darf nicht leer sein.")
+            if not request.strip():
+                errors.append(f"Button {i}: Spot-Request darf nicht leer sein.")
         return errors
 
     def _gather_config(self) -> dict:
@@ -1785,7 +1832,7 @@ class WifiButtonBuilder(tk.Tk):
         for ed in self.button_editors:
             ed.destroy()
         self.button_editors.clear()
-        for btn_data in cfg.get("buttons", []):
+        for btn_data in (cfg.get("buttons") or [None]):
             self._add_button(btn_data)
 
     def _auto_save_config(self):
@@ -2054,14 +2101,14 @@ class WifiButtonBuilder(tk.Tk):
         ttk.Button(top, text="⬆ Import…", command=self._db_import).pack(side="left", padx=(4, 0))
         self.db_search_var.trace_add("write", lambda *a: self._db_refresh())
 
-        cols = ("customer", "location", "mac", "device_name", "ip", "buttons", "count")
+        cols = ("customer", "location", "mac", "device_name", "ip", "request", "count")
         headings = {"customer": "Kunde", "location": "Standort", "mac": "MAC",
-                    "device_name": "Gerät", "ip": "IP", "buttons": "Buttons",
+                    "device_name": "Gerät", "ip": "IP", "request": "Request",
                     "count": "#"}
         # Small base widths + stretch: the tree fills its pane instead of forcing
         # it wide, so the DB panel stays sane when the window isn't maximized.
         widths = {"customer": 90, "location": 80, "mac": 115, "device_name": 85,
-                  "ip": 85, "buttons": 95, "count": 30}
+                  "ip": 85, "request": 100, "count": 30}
         tree_frame = ttk.Frame(f)
         tree_frame.pack(fill="both", expand=True, pady=(8, 0))
         self.db_tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
@@ -2086,15 +2133,17 @@ class WifiButtonBuilder(tk.Tk):
         ttk.Label(f, text=src, foreground="gray").pack(anchor="w", pady=(4, 0))
 
     @staticmethod
-    def _fmt_buttons(js: str) -> str:
+    def _fmt_request(js: str) -> str:
+        """Spot-Request des ersten Buttons (aus der gespeicherten URL gelöst —
+        funktioniert auch für Bestandsgeräte)."""
         try:
             arr = json.loads(js) if js else []
         except Exception:
             arr = []
-        if not arr:
+        if not arr or not isinstance(arr[0], dict):
             return ""
-        first = arr[0].get("name", "") if isinstance(arr[0], dict) else ""
-        return f"{len(arr)} × {first}" + (" …" if len(arr) > 1 else "")
+        _host, _pass, request = parse_action_url(arr[0].get("url", ""))
+        return request + (f"  (+{len(arr) - 1})" if len(arr) > 1 else "")
 
     def _db_selected_mac(self):
         sel = self.db_tree.selection()
@@ -2114,7 +2163,7 @@ class WifiButtonBuilder(tk.Tk):
         for i, (cust, loc, mac, name, ip, _ssid, buttons, _last, cnt, _notes) in enumerate(rows):
             self.db_tree.insert("", "end",
                                  values=(cust, loc, mac, name, ip,
-                                         self._fmt_buttons(buttons), cnt),
+                                         self._fmt_request(buttons), cnt),
                                  tags=("odd" if i % 2 else "even",))
 
     def _refresh_db_dropdowns(self, prefill: bool = False):
@@ -2228,7 +2277,22 @@ class WifiButtonBuilder(tk.Tk):
         dwin.geometry("720x560")
         nb = ttk.Notebook(dwin)
         nb.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Aktionen: Host / WebIF-Pass / Spot-Request je Button, aus der URL
+        # gelöst (auch für Bestandsgeräte).
+        lines = []
+        for i, btn in enumerate((cfg or {}).get("buttons", []), 1):
+            host, webif_pass, request = parse_action_url(btn.get("url", ""))
+            lines.append(f"Button {i}: {btn.get('name', '')}")
+            lines.append(f"  Host (IP):    {host}")
+            lines.append(f"  WebIF-Pass:   {webif_pass}")
+            lines.append(f"  Spot-Request: {request}")
+            lines.append(f"  URL:          {btn.get('url', '')}")
+            lines.append("")
+        actions = "\n".join(lines).rstrip() or "—"
+
         for label, content in [
+            ("Aktionen", actions),
             ("Config (JSON)", json.dumps(cfg, indent=2, ensure_ascii=False) if cfg else "—"),
             ("Sketch (.ino)", ino or "— (vor diesem Update geflasht)"),
         ]:
