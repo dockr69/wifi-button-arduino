@@ -135,6 +135,28 @@ def test_update_from_read_creates_record_for_unknown_mac(fresh_db):
     assert row["ip"] == "DHCP"
 
 
+class _FakePort:
+    def __init__(self, device, serial_number):
+        self.device = device
+        self.serial_number = serial_number
+
+
+def test_detected_ports_filters_to_mac_bearing_ports(monkeypatch):
+    fake = [
+        _FakePort("/dev/cu.usbmodem1", "F0:F5:BD:11:22:33"),   # a button
+        _FakePort("/dev/cu.Bluetooth-Incoming", None),          # noise
+        _FakePort("/dev/cu.debug-console", "no-mac-here"),      # noise
+        _FakePort("/dev/cu.usbmodem2", "aa:bb:cc:dd:ee:ff"),    # a button
+    ]
+    import serial.tools.list_ports as lp
+    monkeypatch.setattr(lp, "comports", lambda: fake)
+
+    assert w.list_serial_ports() == ["/dev/cu.usbmodem1", "/dev/cu.usbmodem2"]
+    assert w.connected_macs() == ["F0:F5:BD:11:22:33", "AA:BB:CC:DD:EE:FF"]
+    assert w.mac_from_port("/dev/cu.usbmodem2") == "AA:BB:CC:DD:EE:FF"
+    assert w.mac_from_port("/dev/cu.Bluetooth-Incoming") is None
+
+
 def test_parse_dump_roundtrips_firmware_output():
     dump = (
         "ssid=MyNet\nipmode=static\nip=192.168.1.50\ngw=192.168.1.1\n"

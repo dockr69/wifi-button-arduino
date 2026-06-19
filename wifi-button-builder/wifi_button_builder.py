@@ -12,17 +12,12 @@ import json
 import os
 import re
 import ipaddress
-import shutil
 import sqlite3
 import subprocess
 import sys
-import tarfile
-import tempfile
 import threading
 import time
 import queue
-import urllib.request
-import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -30,9 +25,8 @@ from pathlib import Path
 # serial number, so we can read it without any firmware running.
 MAC_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 
-# Windows: stop each child process (arduino-cli, git) from flashing a console
-# window — the GUI is windowed but the 5s board-list poller would otherwise pop
-# a cmd window constantly. CREATE_NO_WINDOW exists only on Windows; 0 elsewhere.
+# Windows: stop child processes (git) from flashing a console window — the GUI
+# is windowed. CREATE_NO_WINDOW exists only on Windows; 0 elsewhere.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
@@ -86,9 +80,6 @@ TX_POWER_MAP = {
 
 # Hardcoded wakeup pin: Adafruit Feather ESP32-C6 "A5 / IO2" — RTC GPIO, button to GND.
 WAKEUP_GPIO = 2
-
-# Arduino CLI target board
-FQBN = "esp32:esp32:adafruit_feather_esp32c6"
 
 # Hardcoded maintenance: hold the button 5s → stay awake 60s for reflashing.
 # Long stay-awake is critical so the user has time to push a new sketch via USB
@@ -571,139 +562,29 @@ def wb_git_push(message: str) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
-# ── Arduino CLI integration ───────────────────────────────────────────────────
-
-CLI_HOME = Path.home() / ".wifi-button-builder"
-CLI_BIN_NAME = "arduino-cli.exe" if sys.platform == "win32" else "arduino-cli"
-CLI_BIN = CLI_HOME / "bin" / CLI_BIN_NAME
-CLI_DATA = CLI_HOME / "data"
-CLI_CFG_DIR = CLI_HOME / "config"
-
-
-def arduino_cli_path() -> Path | None:
-    """Return path to a usable arduino-cli, preferring our managed copy."""
-    if CLI_BIN.exists():
-        return CLI_BIN
-    sys_path = shutil.which("arduino-cli")
-    return Path(sys_path) if sys_path else None
-
-
-def _cli_download_url() -> str:
-    """Build the official arduino-cli download URL for the current platform."""
-    base = "https://downloads.arduino.cc/arduino-cli/arduino-cli_latest"
-    if sys.platform == "darwin":
-        suffix = "macOS_ARM64.tar.gz" if "arm" in os.uname().machine.lower() else "macOS_64bit.tar.gz"
-    elif sys.platform == "win32":
-        suffix = "Windows_64bit.zip"
-    else:
-        suffix = "Linux_64bit.tar.gz"
-    return f"{base}_{suffix}"
-
-
-def download_arduino_cli(log_cb):
-    """Download + extract arduino-cli into CLI_BIN. log_cb(str) for progress."""
-    url = _cli_download_url()
-    log_cb(f"Downloading arduino-cli from {url}")
-    CLI_BIN.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(url).suffix) as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        urllib.request.urlretrieve(url, tmp_path)
-        log_cb(f"Downloaded {tmp_path.stat().st_size // 1024} KB, extracting…")
-        if url.endswith(".zip"):
-            with zipfile.ZipFile(tmp_path) as zf:
-                for member in zf.namelist():
-                    if member.endswith(CLI_BIN_NAME):
-                        with zf.open(member) as src, open(CLI_BIN, "wb") as dst:
-                            shutil.copyfileobj(src, dst)
-                        break
-        else:
-            with tarfile.open(tmp_path, "r:gz") as tf:
-                for member in tf.getmembers():
-                    if member.name.endswith(CLI_BIN_NAME):
-                        with tf.extractfile(member) as src, open(CLI_BIN, "wb") as dst:
-                            shutil.copyfileobj(src, dst)
-                        break
-        if sys.platform != "win32":
-            CLI_BIN.chmod(0o755)
-        log_cb(f"arduino-cli installed: {CLI_BIN}")
-    finally:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-
-
-def _cli_base_args() -> list[str]:
-    """Common args isolating arduino-cli state to our home dir."""
-    CLI_DATA.mkdir(parents=True, exist_ok=True)
-    CLI_CFG_DIR.mkdir(parents=True, exist_ok=True)
-    return [
-        str(arduino_cli_path()),
-        "--config-dir", str(CLI_CFG_DIR),
-    ]
-
-
-def run_cli(args: list[str], log_cb) -> int:
-    """Run arduino-cli with given args, stream output via log_cb. Returns exit code."""
-    cmd = _cli_base_args() + args
-    log_cb(f"$ {' '.join(cmd)}")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        creationflags=_NO_WINDOW,
-    )
-    for line in proc.stdout:
-        log_cb(line.rstrip())
-    proc.wait()
-    return proc.returncode
-
-
-def ensure_esp32_core(log_cb) -> bool:
-    """Install esp32:esp32 core if missing. Returns True on success."""
-    # First, ensure the board manager URL is set (arduino-cli ships without it)
-    # `core list` triggers config-load; we use a dedicated check via `core search`.
-    try:
-        out = subprocess.check_output(
-            _cli_base_args() + ["core", "list", "--format", "json"],
-            text=True, stderr=subprocess.STDOUT, creationflags=_NO_WINDOW,
-        )
-        data = json.loads(out)
-        platforms = data.get("platforms", []) if isinstance(data, dict) else data
-        for p in platforms:
-            if p.get("id") == "esp32:esp32" and p.get("installed_version"):
-                log_cb(f"esp32:esp32 already installed (v{p['installed_version']})")
-                return True
-    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as e:
-        log_cb(f"core list check failed: {e}")
-
-    log_cb("Updating package index…")
-    if run_cli(["core", "update-index"], log_cb) != 0:
-        log_cb("core update-index failed")
-        return False
-    log_cb("Installing esp32:esp32 core (this downloads ~250MB, takes a while)…")
-    return run_cli(["core", "install", "esp32:esp32"], log_cb) == 0
+# ── Serielle Geräteerkennung (pyserial) ───────────────────────────────────────
+#
+# Der Builder kompiliert/flasht NICHT selbst: Die Techniker bekommen Taster, auf
+# denen das generische Base-Image bereits liegt. Config wird nur per USB-Serial
+# geschrieben (send_config_serial) bzw. gelesen (read_config_serial). Zum
+# Auflisten der Boards reicht deshalb pyserial — kein arduino-cli, kein
+# ESP32-Core-Download, kein Bootstrap.
 
 
 def _detected_ports() -> list[dict]:
-    """Return arduino-cli's detected_ports entries (raw)."""
-    cli = arduino_cli_path()
-    if not cli:
-        return []
-    try:
-        out = subprocess.check_output(
-            _cli_base_args() + ["board", "list", "--format", "json"],
-            text=True, stderr=subprocess.STDOUT, timeout=10,
-            creationflags=_NO_WINDOW,
-        )
-        data = json.loads(out)
-        ports = data.get("detected_ports", []) if isinstance(data, dict) else data
-        return ports or []
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
-        return []
+    """Angeschlossene ESP32-C6-Boards via pyserial. Behält die frühere Form der
+    arduino-cli-Ausgabe (address + serialNumber), damit die Aufrufer unverändert
+    bleiben. Auf dem ESP32-C6 (USB-Serial-JTAG) legt das ROM die Basis-MAC in die
+    USB-Seriennummer — wir listen nur Ports mit einer MAC darin (die echten
+    Taster, ohne Bluetooth-/Debug-Ports)."""
+    from serial.tools import list_ports
+    out = []
+    for p in list_ports.comports():
+        sn = p.serial_number or ""
+        if p.device and MAC_RE.search(sn):
+            out.append({"port": {"address": p.device,
+                                 "properties": {"serialNumber": sn}}})
+    return out
 
 
 def list_serial_ports() -> list[str]:
@@ -740,20 +621,6 @@ def mac_from_port(port: str) -> str | None:
             if m:
                 return m.group(1).upper()
     return None
-
-
-def compile_and_upload(sketch_dir: Path, port: str, log_cb) -> bool:
-    """Compile sketch and upload to port. Returns True on success."""
-    log_cb(f"Compiling for {FQBN}…")
-    if run_cli(["compile", "--fqbn", FQBN, str(sketch_dir)], log_cb) != 0:
-        log_cb("✗ Compile failed")
-        return False
-    log_cb(f"Uploading to {port}…")
-    if run_cli(["upload", "-p", port, "--fqbn", FQBN, str(sketch_dir)], log_cb) != 0:
-        log_cb("✗ Upload failed")
-        return False
-    log_cb("✓ Flash erfolgreich")
-    return True
 
 
 def _parse_button_url(url: str, method: str):
@@ -1295,7 +1162,6 @@ class WifiButtonBuilder(tk.Tk):
 
         self.config_data = dict(DEFAULT_CONFIG)
         self.button_editors: list[ButtonEditor] = []
-        self.bootstrap_ready = False
         self.status_queue: queue.Queue = queue.Queue()
         # Connected boards, kept fresh by a background poller (see _device_poller).
         self._connected_macs: list[str] = []
@@ -1306,7 +1172,6 @@ class WifiButtonBuilder(tk.Tk):
         self._db_refresh()
         self._refresh_db_dropdowns(prefill=True)
         self.after(100, self._drain_status_queue)
-        threading.Thread(target=self._bootstrap, daemon=True).start()
         # Keep the shared DB in sync: pull on a loop and refresh the panel
         # whenever the file actually changes (no manual reload needed).
         threading.Thread(target=self._db_poller, daemon=True).start()
@@ -1342,7 +1207,7 @@ class WifiButtonBuilder(tk.Tk):
         style.configure("TLabelframe.Label", font=("", 10, "bold"))
 
         # Statusbar at the very bottom (packed first with side=bottom so it sticks)
-        self.status_var = tk.StringVar(value="Starte arduino-cli Bootstrap…")
+        self.status_var = tk.StringVar(value="Bereit.")
         status = ttk.Label(self, textvariable=self.status_var,
                            relief="sunken", anchor="w", padding=(6, 2))
         status.pack(side="bottom", fill="x")
@@ -1513,7 +1378,7 @@ class WifiButtonBuilder(tk.Tk):
                   foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
     def _build_flash_section(self):
-        f = ttk.LabelFrame(self.scroll_frame, text="Flashen (arduino-cli)", padding=8)
+        f = ttk.LabelFrame(self.scroll_frame, text="Taster (USB-Serial)", padding=8)
         f.pack(fill="x", pady=(0, 6))
 
         ttk.Label(f, text="Port:").grid(row=0, column=0, sticky="w")
@@ -1521,13 +1386,12 @@ class WifiButtonBuilder(tk.Tk):
         self.port_combo = ttk.Combobox(f, textvariable=self.port_var, width=30, state="readonly")
         self.port_combo.grid(row=0, column=1, sticky="w", padx=(4, 4))
 
-        self.flash_button = ttk.Button(f, text="⚡ Config senden", command=self._flash, state="disabled")
+        self.flash_button = ttk.Button(f, text="⚡ Config senden", command=self._flash)
         self.flash_button.grid(row=0, column=3, padx=(8, 0))
 
-        # Auslesen braucht nur pyserial (kein arduino-cli) -> sofort nutzbar.
         ttk.Button(f, text="📥 Auslesen", command=self._read_config).grid(row=0, column=4, padx=(4, 0))
 
-        ttk.Label(f, text="Adafruit Feather ESP32-C6 · Board im Bootloader-Modus (BOOT halten, RESET tippen)",
+        ttk.Label(f, text="Adafruit Feather ESP32-C6 mit Base-Image · per USB anstecken (Config-Modus)",
                   foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
     def _build_buttons_section(self):
@@ -1799,13 +1663,10 @@ class WifiButtonBuilder(tk.Tk):
             except Exception:
                 pass
 
-    # ── Bootstrap & arduino-cli integration ───────────────────────────────
+    # ── Status queue & device polling ──────────────────────────────────────
 
     def _post_status(self, msg: str):
         self.status_queue.put(("status", msg))
-
-    def _post_ready(self):
-        self.status_queue.put(("ready", None))
 
     def _drain_status_queue(self):
         try:
@@ -1813,9 +1674,6 @@ class WifiButtonBuilder(tk.Tk):
                 kind, payload = self.status_queue.get_nowait()
                 if kind == "status":
                     self.status_var.set(payload)
-                elif kind == "ready":
-                    self.bootstrap_ready = True
-                    self.flash_button.configure(state="normal")
                 elif kind == "ports_changed":
                     ports, macs = payload
                     self._connected_macs = macs
@@ -1833,28 +1691,10 @@ class WifiButtonBuilder(tk.Tk):
             pass
         self.after(200, self._drain_status_queue)
 
-    def _bootstrap(self):
-        try:
-            cli = arduino_cli_path()
-            if cli is None:
-                self._post_status("arduino-cli wird heruntergeladen…")
-                download_arduino_cli(self._post_status)
-            else:
-                self._post_status(f"arduino-cli gefunden: {cli}")
-            self._post_status("Prüfe ESP32-Core…")
-            if not ensure_esp32_core(self._post_status):
-                self._post_status("✗ ESP32-Core Installation fehlgeschlagen")
-                return
-            self._post_status("✓ arduino-cli bereit")
-            self._post_ready()
-        except Exception as e:
-            self._post_status(f"✗ Bootstrap-Fehler: {e}")
-
     def _scan_devices(self, force: bool = False):
-        """Detect ports + board MACs in ONE board-list call (runs in a thread).
+        """Detect connected boards' ports + MACs via pyserial (runs in a thread).
 
-        Posts to the UI queue only when something changed (or when forced), so
-        the main thread never runs the arduino-cli subprocess itself."""
+        Posts to the UI queue only when something changed (or when forced)."""
         ports, macs = [], []
         for entry in _detected_ports():
             p = entry.get("port", {})
