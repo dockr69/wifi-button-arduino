@@ -1295,15 +1295,15 @@ class WifiButtonBuilder(tk.Tk):
                         troughcolor=C["bg"], arrowcolor=C["muted"],
                         borderwidth=0, **flat)
 
-    def _on_first_map(self, _event=None):
-        """Once the window has a real size, place the editor|DB sash at 60/40 so
-        the DB panel doesn't dominate when the window isn't maximized."""
-        self.unbind("<Map>")
-        self.update_idletasks()
-        try:
-            self._paned.sashpos(0, int(self.winfo_width() * 0.60))
-        except tk.TclError:
-            pass
+    def _show_view(self, key: str):
+        """Switch between the 'editor' and 'db' pages (segmented toggle)."""
+        self.view_var.set(key)
+        self.editor_view.pack_forget()
+        self.db_view.pack_forget()
+        view = self.editor_view if key == "editor" else self.db_view
+        view.pack(fill="both", expand=True)
+        for k, btn in self._nav_buttons.items():
+            btn.configure(style="Accent.TButton" if k == key else "TButton")
 
     def _update_conn_indicator(self, macs):
         if macs:
@@ -1328,39 +1328,51 @@ class WifiButtonBuilder(tk.Tk):
         self.conn_label.pack(side="right")
         ttk.Separator(self, orient="horizontal").pack(side="top", fill="x")
 
+        # Segmented page switcher: Konfiguration | Datenbank.
+        nav = ttk.Frame(self, padding=(16, 8))
+        nav.pack(side="top", fill="x")
+        self.view_var = tk.StringVar(value="editor")
+        self._nav_buttons = {}
+        for key, label in (("editor", "⚙  Konfiguration"), ("db", "🗄  Datenbank")):
+            b = ttk.Button(nav, text=label, command=lambda k=key: self._show_view(k))
+            b.pack(side="left", padx=(0, 6))
+            self._nav_buttons[key] = b
+        ttk.Separator(self, orient="horizontal").pack(side="top", fill="x")
+
         # Statusbar at the very bottom (packed bottom-first so it sticks).
         self.status_var = tk.StringVar(value="Bereit.")
         ttk.Label(self, textvariable=self.status_var, style="Status.TLabel",
                   anchor="w", padding=(16, 6)).pack(side="bottom", fill="x")
         ttk.Separator(self, orient="horizontal").pack(side="bottom", fill="x")
 
-        # Split window: config editor (left) | always-on device DB (right).
-        paned = ttk.PanedWindow(self, orient="horizontal")
-        paned.pack(side="top", fill="both", expand=True)
-        self._paned = paned
-        self.bind("<Map>", self._on_first_map)
+        # Body holds two stacked pages; _show_view() shows one at a time.
+        body = ttk.Frame(self)
+        body.pack(side="top", fill="both", expand=True)
+        self.editor_view = ttk.Frame(body, padding=(12, 12))
+        self.db_view = ttk.Frame(body, padding=(12, 12))
 
-        left = ttk.Frame(paned, padding=(12, 12, 6, 12))
-        right = ttk.Frame(paned, padding=(6, 12, 12, 12))
-        paned.add(left, weight=3)
-        paned.add(right, weight=2)
-
-        canvas = tk.Canvas(left, highlightthickness=0, background=self.C["bg"])
-        scrollbar = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
+        # Editor page: scrollable config form.
+        canvas = tk.Canvas(self.editor_view, highlightthickness=0,
+                           background=self.C["bg"])
+        scrollbar = ttk.Scrollbar(self.editor_view, orient="vertical",
+                                  command=canvas.yview)
         self.scroll_frame = ttk.Frame(canvas)
 
         self.scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
+        win = canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
+        # Stretch the inner frame to the canvas width so cards fill the page.
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
         canvas.configure(yscrollcommand=scrollbar.set)
 
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
         def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            if self.view_var.get() == "editor":
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
-        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+        canvas.bind_all("<Button-4>", lambda e: self.view_var.get() == "editor" and canvas.yview_scroll(-1, "units"))
+        canvas.bind_all("<Button-5>", lambda e: self.view_var.get() == "editor" and canvas.yview_scroll(1, "units"))
 
         self._build_device_section()
         self._build_wifi_section()
@@ -1370,7 +1382,10 @@ class WifiButtonBuilder(tk.Tk):
         self._build_flash_section()
         self._build_actions()
 
-        self._build_db_panel(right)
+        # Database page.
+        self._build_db_panel(self.db_view)
+
+        self._show_view("editor")
 
     def _build_device_section(self):
         f = ttk.LabelFrame(self.scroll_frame, text="Gerät (Adafruit Feather ESP32-C6)", padding=8)
