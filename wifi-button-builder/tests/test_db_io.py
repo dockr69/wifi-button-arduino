@@ -98,3 +98,57 @@ def test_records_without_mac_are_skipped(fresh_db):
     added, updated = w.wb_import_records(
         [{"device_name": "no-mac"}], {"AA:BB:CC:00:00:01"})
     assert (added, updated) == (0, 0)
+
+
+def test_update_from_read_preserves_metadata_and_flash_count(fresh_db):
+    # Existing device, flashed twice.
+    w.wb_register("AA:BB:CC:00:00:01", _cfg("Kasse 1"), ino="// k")
+    w.wb_register("AA:BB:CC:00:00:01", _cfg("Kasse 1"), ino="// k")
+    assert w.wb_full_row("AA:BB:CC:00:00:01")["flash_count"] == 2
+
+    # A CFG? read only yields WLAN + buttons — no password, no metadata.
+    read = {"wifi_ssid": "NewNet", "ip_mode": "static", "static_ip": "10.0.0.9",
+            "gateway": "10.0.0.1", "subnet": "255.255.255.0", "dns": "8.8.8.8",
+            "buttons": [{"name": "Button 1", "url": "http://y:8080/new",
+                         "method": "POST"}]}
+    assert w.wb_update_from_read("AA:BB:CC:00:00:01", read) == "updated"
+
+    cfg = w.wb_get_config("AA:BB:CC:00:00:01")
+    assert cfg["wifi_ssid"] == "NewNet"               # read wins
+    assert cfg["static_ip"] == "10.0.0.9"
+    assert cfg["buttons"] == read["buttons"]
+    assert cfg["wifi_password"] == "pw"               # preserved
+    assert cfg["customer"] == "ACME"                  # preserved
+    assert cfg["device_name"] == "Kasse 1"            # preserved
+    row = w.wb_full_row("AA:BB:CC:00:00:01")
+    assert row["flash_count"] == 2                    # a read is not a flash
+    assert row["ip"] == "10.0.0.9"
+
+
+def test_update_from_read_creates_record_for_unknown_mac(fresh_db):
+    read = {"wifi_ssid": "Net", "ip_mode": "dhcp_cache",
+            "buttons": [{"name": "Button 1", "url": "http://h/p", "method": "GET"}]}
+    assert w.wb_update_from_read("11:22:33:44:55:66", read) == "created"
+    row = w.wb_full_row("11:22:33:44:55:66")
+    assert row is not None
+    assert row["flash_count"] == 0
+    assert row["ip"] == "DHCP"
+
+
+def test_parse_dump_roundtrips_firmware_output():
+    dump = (
+        "ssid=MyNet\nipmode=static\nip=192.168.1.50\ngw=192.168.1.1\n"
+        "sn=255.255.255.0\ndns=8.8.8.8\nwifitmo=10000\nhttptmo=3000\n"
+        "repcnt=2\nrepint=60000\ntxpow=20dBm\npsave=1\nbtncnt=2\n"
+        "b0=192.168.1.10 8080 POST /trigger\nb1=example.com 80 GET /ping\nEND\n")
+    cfg = w._parse_dump(dump)
+    assert cfg["wifi_ssid"] == "MyNet"
+    assert cfg["wifi_timeout_s"] == 10                # ms -> s
+    assert cfg["repeat_interval_s"] == 60
+    assert cfg["wifi_power_save"] is True
+    assert cfg["buttons"] == [
+        {"name": "Button 1", "url": "http://192.168.1.10:8080/trigger", "method": "POST"},
+        {"name": "Button 2", "url": "http://example.com/ping", "method": "GET"},
+    ]
+    assert "wifi_password" not in cfg                 # firmware never dumps it
+    assert w._parse_dump("garbage with no kv pairs") is None

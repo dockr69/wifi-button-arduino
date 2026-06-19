@@ -200,6 +200,48 @@ def wb_register(mac: str, cfg: dict, ino: str = "") -> None:
     con.close()
 
 
+def wb_update_from_read(mac: str, read_cfg: dict) -> str:
+    """Nur die per CFG? ausgelesenen Felder (WLAN + Buttons) in den DB-Eintrag
+    übernehmen. Metadaten (Kunde/Standort/Gerätename), Passwort und flash_count
+    bleiben unangetastet — das Base-Image gibt sie nicht aus. Gibt 'updated' für
+    einen vorhandenen bzw. 'created' für einen neu angelegten Eintrag zurück."""
+    mac = mac.upper()
+    existing = wb_get_config(mac) or {}
+    merged = {**existing, **read_cfg}
+    ip = merged.get("static_ip", "") if merged.get("ip_mode") == "static" else "DHCP"
+    buttons = json.dumps(merged.get("buttons", []), ensure_ascii=False)
+    config_json = json.dumps(merged, ensure_ascii=False)
+    con = wb_db()
+    found = con.execute("SELECT 1 FROM wifi_buttons WHERE mac=?", (mac,)).fetchone()
+    if found:
+        con.execute(
+            """UPDATE wifi_buttons SET
+                   ip_mode=?, ip=?, gateway=?, subnet=?, dns=?, wifi_ssid=?,
+                   buttons=?, config_json=?
+               WHERE mac=?""",
+            (merged.get("ip_mode", ""), ip, merged.get("gateway", ""),
+             merged.get("subnet", ""), merged.get("dns", ""),
+             merged.get("wifi_ssid", ""), buttons, config_json, mac),
+        )
+        result = "updated"
+    else:
+        now = datetime.now().isoformat(timespec="seconds")
+        con.execute(
+            """INSERT INTO wifi_buttons
+                   (mac, customer, location, device_name, ip_mode, ip, gateway,
+                    subnet, dns, wifi_ssid, wifi_password, buttons, config_json,
+                    ino, first_seen, last_flashed, flash_count, notes)
+               VALUES (?,'','','',?,?,?,?,?,?,'',?,?,'',?,NULL,0,'')""",
+            (mac, merged.get("ip_mode", ""), ip, merged.get("gateway", ""),
+             merged.get("subnet", ""), merged.get("dns", ""),
+             merged.get("wifi_ssid", ""), buttons, config_json, now),
+        )
+        result = "created"
+    con.commit()
+    con.close()
+    return result
+
+
 def _wb_rows(where: str = "", params: tuple = ()) -> list[tuple]:
     con = wb_db()
     rows = con.execute(
@@ -783,6 +825,109 @@ def send_config_serial(port: str, cfg: dict, log_cb) -> bool:
     except Exception as e:
         log_cb(f"✗ Serial-Fehler: {e}")
         return False
+
+
+def _parse_dump(text: str) -> dict | None:
+    """CFG?-Dump des Base-Images in ein (Teil-)Config-Dict übersetzen.
+    Gibt None zurück, wenn nichts Verwertbares enthalten ist. Das WLAN-Passwort
+    wird vom Base-Image bewusst NICHT ausgegeben und fehlt daher hier."""
+    kv: dict[str, str] = {}
+    btns: dict[int, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line == "END":
+            break
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        m = re.fullmatch(r"b(\d+)", key)
+        if m:
+            btns[int(m.group(1))] = val
+        else:
+            kv[key] = val
+    if not kv and not btns:
+        return None
+
+    def _int(key, default, scale=1):
+        try:
+            return max(1, int(kv[key]) // scale) if scale != 1 else int(kv[key])
+        except (KeyError, ValueError):
+            return default
+
+    cfg: dict = {}
+    if "ssid" in kv:    cfg["wifi_ssid"] = kv["ssid"]
+    if "ipmode" in kv:  cfg["ip_mode"] = kv["ipmode"]
+    if "ip" in kv:      cfg["static_ip"] = kv["ip"]
+    if "gw" in kv:      cfg["gateway"] = kv["gw"]
+    if "sn" in kv:      cfg["subnet"] = kv["sn"]
+    if "dns" in kv:     cfg["dns"] = kv["dns"]
+    if "wifitmo" in kv: cfg["wifi_timeout_s"] = _int("wifitmo", 10, 1000)
+    if "httptmo" in kv: cfg["http_timeout_s"] = _int("httptmo", 3, 1000)
+    if "repcnt" in kv:  cfg["repeat_count"] = _int("repcnt", 1)
+    if "repint" in kv:  cfg["repeat_interval_s"] = _int("repint", 60, 1000)
+    if "txpow" in kv:   cfg["wifi_tx_power"] = kv["txpow"]
+    if "psave" in kv:   cfg["wifi_power_save"] = kv["psave"] not in ("0", "", "false")
+
+    buttons = []
+    for i in sorted(btns):
+        parts = btns[i].split(" ", 3)
+        host = parts[0] if len(parts) > 0 else ""
+        try:
+            bport = int(parts[1]) if len(parts) > 1 else 80
+        except ValueError:
+            bport = 80
+        meth = parts[2] if len(parts) > 2 else "GET"
+        path = parts[3] if len(parts) > 3 else "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        url = f"http://{host}" + (f":{bport}" if bport != 80 else "") + path
+        buttons.append({"name": f"Button {i + 1}", "url": url, "method": meth})
+    cfg["buttons"] = buttons
+    return cfg
+
+
+def read_config_serial(port: str, log_cb) -> dict | None:
+    """Aktuelle Config per USB-Serial aus dem Base-Image-NVS auslesen (CFG?).
+    Setzt — wie send_config_serial — das geflashte Base-Image im Config-Modus
+    voraus. Gibt ein (Teil-)Config-Dict zurück oder None bei Fehler."""
+    import serial as _serial
+    try:
+        with _serial.Serial(port, 115200, timeout=2) as ser:
+            # Best-effort Reset über DTR -> Board bootet in den Config-Modus
+            try:
+                ser.dtr = False; time.sleep(0.1); ser.dtr = True
+            except Exception:
+                pass
+            time.sleep(1.8)
+            ser.reset_input_buffer()
+            ser.write(b"VER?\n"); time.sleep(0.4)
+            resp = ser.read(ser.in_waiting or 1).decode(errors="ignore")
+            if "VER wbtn" not in resp:
+                log_cb("✗ Keine Antwort vom Base-Image (VER?).")
+                log_cb("  Base-Image geflasht? (ptouch) Board kurz RESET/neu anstecken.")
+                return None
+            log_cb(f"✓ Base-Image erkannt: {resp.strip()}")
+            ser.reset_input_buffer()
+            ser.write(b"CFG?\n")
+            buf = ""
+            deadline = time.time() + 4
+            while time.time() < deadline:
+                chunk = ser.read(ser.in_waiting or 1).decode(errors="ignore")
+                if chunk:
+                    buf += chunk
+                    if "END" in buf:
+                        break
+                else:
+                    time.sleep(0.05)
+            cfg = _parse_dump(buf)
+            if cfg is None:
+                log_cb("✗ Keine gültige CFG?-Antwort empfangen.")
+                return None
+            log_cb(f"✓ Config ausgelesen ({len(cfg.get('buttons', []))} Button(s)).")
+            return cfg
+    except Exception as e:
+        log_cb(f"✗ Serial-Fehler: {e}")
+        return None
 
 
 # ── Code Generator ────────────────────────────────────────────────────────────
@@ -1379,6 +1524,9 @@ class WifiButtonBuilder(tk.Tk):
         self.flash_button = ttk.Button(f, text="⚡ Config senden", command=self._flash, state="disabled")
         self.flash_button.grid(row=0, column=3, padx=(8, 0))
 
+        # Auslesen braucht nur pyserial (kein arduino-cli) -> sofort nutzbar.
+        ttk.Button(f, text="📥 Auslesen", command=self._read_config).grid(row=0, column=4, padx=(4, 0))
+
         ttk.Label(f, text="Adafruit Feather ESP32-C6 · Board im Bootloader-Modus (BOOT halten, RESET tippen)",
                   foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
@@ -1788,6 +1936,93 @@ class WifiButtonBuilder(tk.Tk):
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill="x", padx=4, pady=4)
         ttk.Button(btn_frame, text="Schließen", command=win.destroy).pack(side="right")
+
+    def _read_config(self):
+        port = self.port_var.get().strip()
+        if not port:
+            messagebox.showerror("Kein Port", "Bitte einen seriellen Port auswählen.")
+            return
+        self._open_read_log(port)
+
+    def _open_read_log(self, port: str):
+        win = tk.Toplevel(self)
+        win.title(f"Taster auslesen ← {port}")
+        win.geometry("780x500")
+
+        text_frame = ttk.Frame(win)
+        text_frame.pack(fill="both", expand=True, padx=4, pady=4)
+        text = tk.Text(text_frame, wrap="none", font=("Menlo", 10))
+        sy = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=sy.set)
+        sy.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+
+        log_queue: queue.Queue = queue.Queue()
+
+        def log_cb(msg: str):
+            log_queue.put(msg)
+
+        def drain():
+            try:
+                while True:
+                    msg = log_queue.get_nowait()
+                    text.insert("end", msg + "\n")
+                    text.see("end")
+            except queue.Empty:
+                pass
+            if win.winfo_exists():
+                win.after(80, drain)
+
+        def worker():
+            try:
+                cfg = read_config_serial(port, log_cb)
+                if cfg is not None:
+                    self.after(0, lambda: self._apply_read_config(cfg, port))
+            except Exception as e:
+                log_cb(f"✗ Exception: {e}")
+
+        win.after(80, drain)
+        threading.Thread(target=worker, daemon=True).start()
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill="x", padx=4, pady=4)
+        ttk.Button(btn_frame, text="Schließen", command=win.destroy).pack(side="right")
+
+    def _apply_read_config(self, read_cfg: dict, port: str):
+        """Ausgelesene Config nach Rückfrage ins Formular übernehmen und optional
+        den DB-Eintrag aktualisieren. Felder, die das Base-Image nicht ausgibt
+        (Passwort, Gerätename, Kunde/Standort, Cooldown), bleiben erhalten."""
+        n = len(read_cfg.get("buttons", []))
+        if messagebox.askyesno(
+                "Ins Formular übernehmen?",
+                f"{n} Button(s) ausgelesen. Das WLAN-Passwort gibt der Taster "
+                "nicht aus und bleibt unverändert.\n\n"
+                "Ausgelesene Config ins Formular übernehmen?"):
+            merged = self._gather_config()
+            merged.update(read_cfg)
+            self._apply_config(merged)
+
+        mac = mac_from_port(port)
+        if not mac:
+            return
+        if not messagebox.askyesno(
+                "DB aktualisieren?",
+                f"DB-Eintrag für {mac} mit der ausgelesenen WLAN-/Button-Config "
+                "aktualisieren?\n\nKunde/Standort/Gerätename, Passwort und der "
+                "Flash-Zähler bleiben unverändert."):
+            return
+        try:
+            result = wb_update_from_read(mac, read_cfg)
+        except Exception as e:
+            messagebox.showerror("DB-Fehler", str(e))
+            return
+        verb = "aktualisiert" if result == "updated" else "neu angelegt"
+        where = "ptouch/labels.db" if DB_GIT_DIR else DB_PATH.name
+        wb_git_push(f"wifi-button: {mac} aus Taster ausgelesen ({verb})")
+        self.mac_var.set(mac)
+        self.status_var.set(f"DB {verb} ({where}): {mac}")
+        self._db_refresh()
+        self._refresh_db_dropdowns()
 
     # ── Shared device DB ───────────────────────────────────────────────────
 
