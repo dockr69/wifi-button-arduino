@@ -1202,26 +1202,150 @@ class WifiButtonBuilder(tk.Tk):
                 pass
             time.sleep(5)
 
-    def _build_ui(self):
-        style = ttk.Style()
-        style.configure("TLabelframe.Label", font=("", 10, "bold"))
+    def _init_style(self):
+        # Flat, modern light theme. clam is the only built-in ttk theme that
+        # lets us recolor borders/fields away from the 90s 3D bevels.
+        C = {
+            "bg":      "#FFFFFF", "ink":    "#14181F", "muted":  "#6B7280",
+            "border":  "#E5E7EB", "hover":  "#F3F4F6", "press":  "#E5E7EB",
+            "accent":  "#0D9488", "accent2": "#0F766E", "sel":    "#CCFBF1",
+            "stripe":  "#FAFBFC",
+        }
+        self.C = C
+        import tkinter.font as tkfont
+        fams = set(tkfont.families())
 
-        # Statusbar at the very bottom (packed first with side=bottom so it sticks)
+        def fam(cands):
+            return next((c for c in cands if c in fams), cands[-1])
+
+        ui = fam(["Segoe UI", "SF Pro Text", "Helvetica Neue", "Inter",
+                  "Cantarell", "DejaVu Sans", "TkDefaultFont"])
+        mono = fam(["SF Mono", "Cascadia Code", "JetBrains Mono", "Consolas",
+                    "Menlo", "DejaVu Sans Mono", "TkFixedFont"])
+        self.F = {
+            "ui": (ui, 11), "ui_bold": (ui, 11, "bold"), "small": (ui, 10),
+            "small_bold": (ui, 10, "bold"), "head": (ui, 17, "bold"),
+            "mono": (mono, 11),
+        }
+        self.configure(background=C["bg"])
+        self.option_add("*Font", self.F["ui"])
+        self.option_add("*TCombobox*Listbox.background", C["bg"])
+        self.option_add("*TCombobox*Listbox.foreground", C["ink"])
+        self.option_add("*TCombobox*Listbox.selectBackground", C["sel"])
+        self.option_add("*TCombobox*Listbox.selectForeground", C["ink"])
+
+        s = ttk.Style()
+        try:
+            s.theme_use("clam")
+        except tk.TclError:
+            pass
+        flat = dict(bordercolor=C["border"], lightcolor=C["border"],
+                    darkcolor=C["border"])
+        s.configure(".", background=C["bg"], foreground=C["ink"],
+                    font=self.F["ui"], focuscolor=C["accent"])
+        s.configure("TFrame", background=C["bg"])
+        s.configure("TLabel", background=C["bg"], foreground=C["ink"])
+        s.configure("Muted.TLabel", background=C["bg"], foreground=C["muted"],
+                    font=self.F["small"])
+        s.configure("Status.TLabel", background=C["bg"], foreground=C["muted"],
+                    font=self.F["small"])
+        s.configure("Header.TLabel", background=C["bg"], foreground=C["ink"],
+                    font=self.F["head"])
+        s.configure("TLabelframe", background=C["bg"], relief="solid",
+                    borderwidth=1, padding=12, **flat)
+        s.configure("TLabelframe.Label", background=C["bg"],
+                    foreground=C["accent"], font=self.F["small_bold"])
+        s.configure("TButton", background=C["bg"], foreground=C["ink"],
+                    borderwidth=1, relief="flat", padding=(12, 7),
+                    font=self.F["ui"], **flat)
+        s.map("TButton",
+              background=[("pressed", C["press"]), ("active", C["hover"])],
+              bordercolor=[("active", C["accent"])])
+        s.configure("Accent.TButton", background=C["accent"], foreground="#FFFFFF",
+                    padding=(14, 7), bordercolor=C["accent"],
+                    lightcolor=C["accent"], darkcolor=C["accent"])
+        s.map("Accent.TButton",
+              background=[("pressed", C["accent2"]), ("active", C["accent2"])],
+              foreground=[("disabled", "#C7CBD1")])
+        s.configure("TEntry", fieldbackground=C["bg"], foreground=C["ink"],
+                    borderwidth=1, padding=5, **flat)
+        s.map("TEntry", bordercolor=[("focus", C["accent"])])
+        s.configure("TCombobox", fieldbackground=C["bg"], background=C["bg"],
+                    foreground=C["ink"], arrowcolor=C["muted"], borderwidth=1,
+                    padding=4, **flat)
+        s.map("TCombobox", bordercolor=[("focus", C["accent"])],
+              fieldbackground=[("readonly", C["bg"])])
+        s.configure("TCheckbutton", background=C["bg"], foreground=C["ink"])
+        s.map("TCheckbutton", background=[("active", C["bg"])])
+        s.configure("TRadiobutton", background=C["bg"], foreground=C["ink"])
+        s.map("TRadiobutton", background=[("active", C["bg"])])
+        s.configure("TSeparator", background=C["border"])
+        s.configure("TPanedwindow", background=C["bg"])
+        s.configure("Treeview", background=C["bg"], fieldbackground=C["bg"],
+                    foreground=C["ink"], rowheight=28, borderwidth=0,
+                    font=self.F["ui"])
+        s.configure("Treeview.Heading", background=C["bg"], foreground=C["muted"],
+                    relief="flat", borderwidth=0, padding=(8, 8),
+                    font=self.F["small_bold"])
+        s.map("Treeview.Heading", background=[("active", C["hover"])])
+        s.map("Treeview", background=[("selected", C["sel"])],
+              foreground=[("selected", C["ink"])])
+        for orient in ("Vertical", "Horizontal"):
+            s.configure(f"{orient}.TScrollbar", background=C["hover"],
+                        troughcolor=C["bg"], arrowcolor=C["muted"],
+                        borderwidth=0, **flat)
+
+    def _on_first_map(self, _event=None):
+        """Once the window has a real size, place the editor|DB sash at 60/40 so
+        the DB panel doesn't dominate when the window isn't maximized."""
+        self.unbind("<Map>")
+        self.update_idletasks()
+        try:
+            self._paned.sashpos(0, int(self.winfo_width() * 0.60))
+        except tk.TclError:
+            pass
+
+    def _update_conn_indicator(self, macs):
+        if macs:
+            extra = f"   +{len(macs) - 1} weitere" if len(macs) > 1 else ""
+            self.conn_label.configure(foreground=self.C["accent"])
+            self.conn_var.set(f"●  Verbunden  ·  {macs[0]}{extra}")
+        else:
+            self.conn_label.configure(foreground=self.C["muted"])
+            self.conn_var.set("○  Kein Taster verbunden")
+
+    def _build_ui(self):
+        self._init_style()
+
+        # Header bar — app identity + live "button connected" indicator.
+        header = ttk.Frame(self, padding=(16, 12))
+        header.pack(side="top", fill="x")
+        ttk.Label(header, text="WiFi-Button Builder",
+                  style="Header.TLabel").pack(side="left")
+        self.conn_var = tk.StringVar(value="○  Kein Taster verbunden")
+        self.conn_label = ttk.Label(header, textvariable=self.conn_var,
+                                    style="Muted.TLabel", font=self.F["ui_bold"])
+        self.conn_label.pack(side="right")
+        ttk.Separator(self, orient="horizontal").pack(side="top", fill="x")
+
+        # Statusbar at the very bottom (packed bottom-first so it sticks).
         self.status_var = tk.StringVar(value="Bereit.")
-        status = ttk.Label(self, textvariable=self.status_var,
-                           relief="sunken", anchor="w", padding=(6, 2))
-        status.pack(side="bottom", fill="x")
+        ttk.Label(self, textvariable=self.status_var, style="Status.TLabel",
+                  anchor="w", padding=(16, 6)).pack(side="bottom", fill="x")
+        ttk.Separator(self, orient="horizontal").pack(side="bottom", fill="x")
 
         # Split window: config editor (left) | always-on device DB (right).
         paned = ttk.PanedWindow(self, orient="horizontal")
         paned.pack(side="top", fill="both", expand=True)
+        self._paned = paned
+        self.bind("<Map>", self._on_first_map)
 
-        left = ttk.Frame(paned, padding=(8, 8, 4, 8))
-        right = ttk.Frame(paned, padding=(4, 8, 8, 8))
+        left = ttk.Frame(paned, padding=(12, 12, 6, 12))
+        right = ttk.Frame(paned, padding=(6, 12, 12, 12))
         paned.add(left, weight=3)
         paned.add(right, weight=2)
 
-        canvas = tk.Canvas(left, highlightthickness=0)
+        canvas = tk.Canvas(left, highlightthickness=0, background=self.C["bg"])
         scrollbar = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
         self.scroll_frame = ttk.Frame(canvas)
 
@@ -1386,10 +1510,12 @@ class WifiButtonBuilder(tk.Tk):
         self.port_combo = ttk.Combobox(f, textvariable=self.port_var, width=30, state="readonly")
         self.port_combo.grid(row=0, column=1, sticky="w", padx=(4, 4))
 
-        self.flash_button = ttk.Button(f, text="⚡ Config senden", command=self._flash)
+        self.flash_button = ttk.Button(f, text="⚡ Config senden",
+                                       command=self._flash, style="Accent.TButton")
         self.flash_button.grid(row=0, column=3, padx=(8, 0))
 
-        ttk.Button(f, text="📥 Auslesen", command=self._read_config).grid(row=0, column=4, padx=(4, 0))
+        ttk.Button(f, text="📥 Auslesen", command=self._read_config,
+                   style="Accent.TButton").grid(row=0, column=4, padx=(4, 0))
 
         ttk.Label(f, text="Adafruit Feather ESP32-C6 mit Base-Image · per USB anstecken (Config-Modus)",
                   foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
@@ -1534,7 +1660,10 @@ class WifiButtonBuilder(tk.Tk):
         text_frame = ttk.Frame(win)
         text_frame.pack(fill="both", expand=True, padx=4, pady=4)
 
-        text = tk.Text(text_frame, wrap="none", font=("Consolas", 10))
+        text = tk.Text(text_frame, wrap="none", font=self.F["mono"],
+                       background=self.C["bg"], foreground=self.C["ink"],
+                       insertbackground=self.C["accent"], relief="flat",
+                       borderwidth=0, highlightthickness=0, padx=10, pady=8)
         sy = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
         sx = ttk.Scrollbar(text_frame, orient="horizontal", command=text.xview)
         text.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
@@ -1677,6 +1806,7 @@ class WifiButtonBuilder(tk.Tk):
                 elif kind == "ports_changed":
                     ports, macs = payload
                     self._connected_macs = macs
+                    self._update_conn_indicator(macs)
                     cur = self.port_var.get()
                     self.port_combo["values"] = ports
                     if cur not in ports:
@@ -1740,7 +1870,10 @@ class WifiButtonBuilder(tk.Tk):
 
         text_frame = ttk.Frame(win)
         text_frame.pack(fill="both", expand=True, padx=4, pady=4)
-        text = tk.Text(text_frame, wrap="none", font=("Menlo", 10))
+        text = tk.Text(text_frame, wrap="none", font=self.F["mono"],
+                       background=self.C["bg"], foreground=self.C["ink"],
+                       insertbackground=self.C["accent"], relief="flat",
+                       borderwidth=0, highlightthickness=0, padx=10, pady=8)
         sy = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=sy.set)
         sy.pack(side="right", fill="y")
@@ -1791,7 +1924,10 @@ class WifiButtonBuilder(tk.Tk):
 
         text_frame = ttk.Frame(win)
         text_frame.pack(fill="both", expand=True, padx=4, pady=4)
-        text = tk.Text(text_frame, wrap="none", font=("Menlo", 10))
+        text = tk.Text(text_frame, wrap="none", font=self.F["mono"],
+                       background=self.C["bg"], foreground=self.C["ink"],
+                       insertbackground=self.C["accent"], relief="flat",
+                       borderwidth=0, highlightthickness=0, padx=10, pady=8)
         sy = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=sy.set)
         sy.pack(side="right", fill="y")
@@ -1907,16 +2043,21 @@ class WifiButtonBuilder(tk.Tk):
         headings = {"customer": "Kunde", "location": "Standort", "mac": "MAC",
                     "device_name": "Gerät", "ip": "IP", "buttons": "Buttons",
                     "count": "#"}
-        widths = {"customer": 90, "location": 80, "mac": 120, "device_name": 90,
-                  "ip": 95, "buttons": 110, "count": 28}
+        # Small base widths + stretch: the tree fills its pane instead of forcing
+        # it wide, so the DB panel stays sane when the window isn't maximized.
+        widths = {"customer": 90, "location": 80, "mac": 115, "device_name": 85,
+                  "ip": 85, "buttons": 95, "count": 30}
         tree_frame = ttk.Frame(f)
-        tree_frame.pack(fill="both", expand=True, pady=(6, 0))
+        tree_frame.pack(fill="both", expand=True, pady=(8, 0))
         self.db_tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
         sy = ttk.Scrollbar(tree_frame, orient="vertical", command=self.db_tree.yview)
         self.db_tree.configure(yscrollcommand=sy.set)
         for c in cols:
             self.db_tree.heading(c, text=headings[c])
-            self.db_tree.column(c, width=widths[c], anchor="w")
+            self.db_tree.column(c, width=widths[c], minwidth=30, anchor="w",
+                                stretch=(c != "count"))
+        self.db_tree.tag_configure("odd", background=self.C["stripe"])
+        self.db_tree.tag_configure("even", background=self.C["bg"])
         sy.pack(side="right", fill="y")
         self.db_tree.pack(side="left", fill="both", expand=True)
         # Single click on a row → load that device into the editor.
@@ -1955,10 +2096,11 @@ class WifiButtonBuilder(tk.Tk):
         except Exception as e:
             self.status_var.set(f"DB-Fehler: {e}")
             return
-        for cust, loc, mac, name, ip, _ssid, buttons, _last, cnt, _notes in rows:
+        for i, (cust, loc, mac, name, ip, _ssid, buttons, _last, cnt, _notes) in enumerate(rows):
             self.db_tree.insert("", "end",
                                  values=(cust, loc, mac, name, ip,
-                                         self._fmt_buttons(buttons), cnt))
+                                         self._fmt_buttons(buttons), cnt),
+                                 tags=("odd" if i % 2 else "even",))
 
     def _refresh_db_dropdowns(self, prefill: bool = False):
         """Populate the customer/location/MAC/IP comboboxes from the DB.
@@ -2077,7 +2219,10 @@ class WifiButtonBuilder(tk.Tk):
         ]:
             frame = ttk.Frame(nb)
             nb.add(frame, text=label)
-            txt = tk.Text(frame, wrap="none", font=("Menlo", 10))
+            txt = tk.Text(frame, wrap="none", font=self.F["mono"],
+                          background=self.C["bg"], foreground=self.C["ink"],
+                          insertbackground=self.C["accent"], relief="flat",
+                          borderwidth=0, highlightthickness=0, padx=10, pady=8)
             sv = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
             txt.configure(yscrollcommand=sv.set)
             sv.pack(side="right", fill="y")
