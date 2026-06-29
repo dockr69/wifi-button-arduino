@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Pre-Push-Gate: verhindert, dass kaputter Builder-Code (oder ein Tag, der die
+# .exe baut) das Remote erreicht. Spiegelt den CI-'test'-Job lokal, nur schneller.
+# Aktivieren (einmalig pro Klon):  git config core.hooksPath .githooks
+set -e
+
+DIR="wifi-button-builder"
+PY="$DIR/.venv/bin/python"
+[ -x "$PY" ] || PY="python3"
+
+echo "pre-push: py_compile + pytest ($DIR) …"
+"$PY" -m py_compile "$DIR/wifi_button_builder.py"
+"$PY" -m pytest "$DIR/tests/" -q
+
+echo "pre-push: OK"
