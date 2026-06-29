@@ -1961,12 +1961,10 @@ class WifiButtonBuilder(tk.Tk):
         self._auto_save_config()
         self._open_flash_log(port, cfg)
 
-    def _open_flash_log(self, port: str, cfg: dict):
-        win = tk.Toplevel(self)
-        win.title(f"Config senden → {port}")
-        win.geometry("780x500")
-
-        text_frame = ttk.Frame(win)
+    def _make_log_text(self, parent) -> tk.Text:
+        """Mono-Text-Widget mit vertikalem Scrollbar in einem gefüllten Frame.
+        Gibt das Text-Widget zurück — geteilt von Flash-/Read-/Log-Fenstern."""
+        text_frame = ttk.Frame(parent)
         text_frame.pack(fill="both", expand=True, padx=4, pady=4)
         text = tk.Text(text_frame, wrap="none", font=self.F["mono"],
                        background=self.C["bg"], foreground=self.C["ink"],
@@ -1976,22 +1974,31 @@ class WifiButtonBuilder(tk.Tk):
         text.configure(yscrollcommand=sy.set)
         sy.pack(side="right", fill="y")
         text.pack(side="left", fill="both", expand=True)
+        return text
 
-        log_queue: queue.Queue = queue.Queue()
-
-        def log_cb(msg: str):
-            log_queue.put(msg)
-
+    def _attach_log_pump(self, win, text: tk.Text, log_queue: queue.Queue):
+        """Leert log_queue alle 80 ms ins Text-Widget, solange das Fenster lebt."""
         def drain():
             try:
                 while True:
-                    msg = log_queue.get_nowait()
-                    text.insert("end", msg + "\n")
+                    text.insert("end", log_queue.get_nowait() + "\n")
                     text.see("end")
             except queue.Empty:
                 pass
             if win.winfo_exists():
                 win.after(80, drain)
+        win.after(80, drain)
+
+    def _open_flash_log(self, port: str, cfg: dict):
+        win = tk.Toplevel(self)
+        win.title(f"Config senden → {port}")
+        win.geometry("780x500")
+
+        text = self._make_log_text(win)
+        log_queue: queue.Queue = queue.Queue()
+
+        def log_cb(msg: str):
+            log_queue.put(msg)
 
         def worker():
             try:
@@ -2001,7 +2008,7 @@ class WifiButtonBuilder(tk.Tk):
             except Exception as e:
                 log_cb(f"✗ Exception: {e}")
 
-        win.after(80, drain)
+        self._attach_log_pump(win, text, log_queue)
         threading.Thread(target=worker, daemon=True).start()
 
         btn_frame = ttk.Frame(win)
@@ -2020,32 +2027,11 @@ class WifiButtonBuilder(tk.Tk):
         win.title(f"Taster auslesen ← {port}")
         win.geometry("780x500")
 
-        text_frame = ttk.Frame(win)
-        text_frame.pack(fill="both", expand=True, padx=4, pady=4)
-        text = tk.Text(text_frame, wrap="none", font=self.F["mono"],
-                       background=self.C["bg"], foreground=self.C["ink"],
-                       insertbackground=self.C["accent"], relief="flat",
-                       borderwidth=0, highlightthickness=0, padx=10, pady=8)
-        sy = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
-        text.configure(yscrollcommand=sy.set)
-        sy.pack(side="right", fill="y")
-        text.pack(side="left", fill="both", expand=True)
-
+        text = self._make_log_text(win)
         log_queue: queue.Queue = queue.Queue()
 
         def log_cb(msg: str):
             log_queue.put(msg)
-
-        def drain():
-            try:
-                while True:
-                    msg = log_queue.get_nowait()
-                    text.insert("end", msg + "\n")
-                    text.see("end")
-            except queue.Empty:
-                pass
-            if win.winfo_exists():
-                win.after(80, drain)
 
         def worker():
             try:
@@ -2055,7 +2041,7 @@ class WifiButtonBuilder(tk.Tk):
             except Exception as e:
                 log_cb(f"✗ Exception: {e}")
 
-        win.after(80, drain)
+        self._attach_log_pump(win, text, log_queue)
         threading.Thread(target=worker, daemon=True).start()
 
         btn_frame = ttk.Frame(win)
@@ -2074,17 +2060,7 @@ class WifiButtonBuilder(tk.Tk):
         win.title(f"Serial Log ← {port}")
         win.geometry("780x540")
 
-        text_frame = ttk.Frame(win)
-        text_frame.pack(fill="both", expand=True, padx=4, pady=4)
-        text = tk.Text(text_frame, wrap="none", font=self.F["mono"],
-                       background=self.C["bg"], foreground=self.C["ink"],
-                       insertbackground=self.C["accent"], relief="flat",
-                       borderwidth=0, highlightthickness=0, padx=10, pady=8)
-        sy = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
-        text.configure(yscrollcommand=sy.set)
-        sy.pack(side="right", fill="y")
-        text.pack(side="left", fill="both", expand=True)
-
+        text = self._make_log_text(win)
         log_queue: queue.Queue = queue.Queue()
         cmd_queue: queue.Queue = queue.Queue()
         stop_event = threading.Event()
@@ -2092,23 +2068,12 @@ class WifiButtonBuilder(tk.Tk):
         def log_cb(msg: str):
             log_queue.put(msg)
 
-        def drain():
-            try:
-                while True:
-                    msg = log_queue.get_nowait()
-                    text.insert("end", msg + "\n")
-                    text.see("end")
-            except queue.Empty:
-                pass
-            if win.winfo_exists():
-                win.after(80, drain)
-
         def on_close():
             stop_event.set()
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", on_close)
-        win.after(80, drain)
+        self._attach_log_pump(win, text, log_queue)
         threading.Thread(
             target=stream_serial_log,
             args=(port, log_cb, stop_event, cmd_queue),
