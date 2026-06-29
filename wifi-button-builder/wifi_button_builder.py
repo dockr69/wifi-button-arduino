@@ -755,22 +755,26 @@ def _parse_dump(text: str) -> dict | None:
 
 
 def stream_serial_log(port: str, log_cb, stop_event: threading.Event,
-                      send_run: bool = False) -> None:
+                      cmd_queue: "queue.Queue | None" = None) -> None:
     """Open the serial port and stream all output until stop_event is set.
 
-    If send_run=True, sends the RUN command first so a test button action fires
-    and its Serial.printf() output is visible in real time."""
+    Ein einziger Thread besitzt den Port. Befehle (z. B. "RUN") werden über
+    cmd_queue eingeschleust und in denselben offenen Port geschrieben — so gibt
+    es nie zwei Reader auf einem Port (kein 'port busy')."""
     import serial as _serial
     try:
         with _serial.Serial(port, 115200, timeout=0.1) as ser:
             log_cb(f"[Verbunden · {port} · 115200 Baud]")
-            if send_run:
-                time.sleep(0.2)
-                ser.reset_input_buffer()
-                ser.write(b"RUN\n")
-                log_cb("[RUN gesendet — Test-Sendung läuft …]")
             buf = b""
             while not stop_event.is_set():
+                if cmd_queue is not None:
+                    try:
+                        while True:
+                            cmd = cmd_queue.get_nowait()
+                            ser.write((cmd + "\n").encode())
+                            log_cb(f"[> {cmd} gesendet]")
+                    except queue.Empty:
+                        pass
                 chunk = ser.read(ser.in_waiting or 1)
                 if chunk:
                     buf += chunk
@@ -2082,6 +2086,7 @@ class WifiButtonBuilder(tk.Tk):
         text.pack(side="left", fill="both", expand=True)
 
         log_queue: queue.Queue = queue.Queue()
+        cmd_queue: queue.Queue = queue.Queue()
         stop_event = threading.Event()
 
         def log_cb(msg: str):
@@ -2098,30 +2103,24 @@ class WifiButtonBuilder(tk.Tk):
             if win.winfo_exists():
                 win.after(80, drain)
 
-        def start_stream(send_run: bool = False):
-            stop_event.clear()
-            threading.Thread(
-                target=stream_serial_log,
-                args=(port, log_cb, stop_event, send_run),
-                daemon=True,
-            ).start()
-
         def on_close():
             stop_event.set()
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", on_close)
         win.after(80, drain)
-        start_stream()
+        threading.Thread(
+            target=stream_serial_log,
+            args=(port, log_cb, stop_event, cmd_queue),
+            daemon=True,
+        ).start()
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill="x", padx=4, pady=4)
         ttk.Button(btn_frame, text="▶ RUN (Test-Sendung)",
-                   command=lambda: start_stream(send_run=True)).pack(side="left")
+                   command=lambda: cmd_queue.put("RUN")).pack(side="left")
         ttk.Button(btn_frame, text="Leeren",
                    command=lambda: text.delete("1.0", "end")).pack(side="left", padx=(6, 0))
-        ttk.Button(btn_frame, text="Stopp",
-                   command=stop_event.set).pack(side="left", padx=(6, 0))
         ttk.Button(btn_frame, text="Schließen",
                    command=on_close).pack(side="right")
 
