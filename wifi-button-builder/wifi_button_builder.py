@@ -754,6 +754,36 @@ def _parse_dump(text: str) -> dict | None:
     return cfg
 
 
+def stream_serial_log(port: str, log_cb, stop_event: threading.Event,
+                      send_run: bool = False) -> None:
+    """Open the serial port and stream all output until stop_event is set.
+
+    If send_run=True, sends the RUN command first so a test button action fires
+    and its Serial.printf() output is visible in real time."""
+    import serial as _serial
+    try:
+        with _serial.Serial(port, 115200, timeout=0.1) as ser:
+            log_cb(f"[Verbunden · {port} · 115200 Baud]")
+            if send_run:
+                time.sleep(0.2)
+                ser.reset_input_buffer()
+                ser.write(b"RUN\n")
+                log_cb("[RUN gesendet — Test-Sendung läuft …]")
+            buf = b""
+            while not stop_event.is_set():
+                chunk = ser.read(ser.in_waiting or 1)
+                if chunk:
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        log_cb(line.decode(errors="replace").rstrip("\r"))
+                else:
+                    time.sleep(0.02)
+            log_cb("[Gestoppt]")
+    except Exception as e:
+        log_cb(f"[Verbindung getrennt: {e}]")
+
+
 def read_config_serial(port: str, log_cb) -> dict | None:
     """Aktuelle Config per USB-Serial aus dem Base-Image-NVS auslesen (CFG?).
     Setzt — wie send_config_serial — das geflashte Base-Image im Config-Modus
@@ -1580,6 +1610,8 @@ class WifiButtonBuilder(tk.Tk):
         self.flash_button.pack(side="left")
         ttk.Button(btns, text="📥 Auslesen", command=self._read_config,
                    style="Accent.TButton").pack(side="left", padx=(6, 0))
+        ttk.Button(btns, text="📋 Log", command=self._show_log,
+                   style="Accent.TButton").pack(side="left", padx=(6, 0))
 
         ttk.Label(f, text="Feather ESP32-C6 mit Base-Image · per USB anstecken (Config-Modus).",
                   style="Muted.TLabel", wraplength=380).grid(
@@ -2025,6 +2057,73 @@ class WifiButtonBuilder(tk.Tk):
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill="x", padx=4, pady=4)
         ttk.Button(btn_frame, text="Schließen", command=win.destroy).pack(side="right")
+
+    def _show_log(self):
+        port = self.port_var.get().strip()
+        if not port:
+            messagebox.showerror("Kein Port", "Bitte einen seriellen Port auswählen.")
+            return
+        self._open_log_window(port)
+
+    def _open_log_window(self, port: str):
+        win = tk.Toplevel(self)
+        win.title(f"Serial Log ← {port}")
+        win.geometry("780x540")
+
+        text_frame = ttk.Frame(win)
+        text_frame.pack(fill="both", expand=True, padx=4, pady=4)
+        text = tk.Text(text_frame, wrap="none", font=self.F["mono"],
+                       background=self.C["bg"], foreground=self.C["ink"],
+                       insertbackground=self.C["accent"], relief="flat",
+                       borderwidth=0, highlightthickness=0, padx=10, pady=8)
+        sy = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=sy.set)
+        sy.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+
+        log_queue: queue.Queue = queue.Queue()
+        stop_event = threading.Event()
+
+        def log_cb(msg: str):
+            log_queue.put(msg)
+
+        def drain():
+            try:
+                while True:
+                    msg = log_queue.get_nowait()
+                    text.insert("end", msg + "\n")
+                    text.see("end")
+            except queue.Empty:
+                pass
+            if win.winfo_exists():
+                win.after(80, drain)
+
+        def start_stream(send_run: bool = False):
+            stop_event.clear()
+            threading.Thread(
+                target=stream_serial_log,
+                args=(port, log_cb, stop_event, send_run),
+                daemon=True,
+            ).start()
+
+        def on_close():
+            stop_event.set()
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        win.after(80, drain)
+        start_stream()
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill="x", padx=4, pady=4)
+        ttk.Button(btn_frame, text="▶ RUN (Test-Sendung)",
+                   command=lambda: start_stream(send_run=True)).pack(side="left")
+        ttk.Button(btn_frame, text="Leeren",
+                   command=lambda: text.delete("1.0", "end")).pack(side="left", padx=(6, 0))
+        ttk.Button(btn_frame, text="Stopp",
+                   command=stop_event.set).pack(side="left", padx=(6, 0))
+        ttk.Button(btn_frame, text="Schließen",
+                   command=on_close).pack(side="right")
 
     def _apply_read_config(self, read_cfg: dict, port: str):
         """Ausgelesene Config nach Rückfrage ins Formular übernehmen und optional
