@@ -88,23 +88,26 @@ WAKEUP_GPIO = 2
 MAINTENANCE_HOLD_MS = 5000
 MAINTENANCE_MS = 60000
 
-# ── Shared device DB (ptouch/labels.db) ────────────────────────────────────────
+# ── Shared device DB (device-db/devices.db) ────────────────────────────────────
 #
-# The ptouch label tool keeps a git-synced SQLite DB (labels.db) keyed by the
-# device MAC. We reuse that exact file so a flashed button's full config (IP,
-# WiFi, HTTP actions …) lives next to its printed-label record and PTouch can
-# show everything. The ptouch repo is private, so storing the WiFi password in
-# plaintext is acceptable. If the ptouch repo isn't checked out beside us, we
-# fall back to a local buttons.db (no git sync).
+# Eine git-synchronisierte SQLite-DB für ALLE Geräte (PTouch-Labels, WiFi-Buttons,
+# Pi-Appliances), keyed u. a. per MAC. Früher ptouch/labels.db — inzwischen ins
+# eigene device-db-Repo migriert/umbenannt (devices.db). So liegt die volle
+# Button-Config neben dem Etiketten-Record. Repo wird über env DEVICE_DB_DIR
+# gefunden, sonst als sibling ../device-db. Für die Übergangszeit wird ein noch
+# vorhandenes ptouch/labels.db akzeptiert; sonst lokale buttons.db ohne git-Sync.
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DEVICE_DB_DIR = Path(os.environ.get(
+    "DEVICE_DB_DIR", str(SCRIPT_DIR.parent.parent / "device-db")))
 PTOUCH_DIR = Path(os.environ.get(
-    "WIFI_BUTTON_PTOUCH_DIR",
-    str(SCRIPT_DIR.parent.parent / "ptouch"),
-))
-if PTOUCH_DIR.is_dir():
-    DB_PATH = PTOUCH_DIR / "labels.db"
-    DB_GIT_DIR: Path | None = PTOUCH_DIR
+    "WIFI_BUTTON_PTOUCH_DIR", str(SCRIPT_DIR.parent.parent / "ptouch")))
+if DEVICE_DB_DIR.is_dir():
+    DB_PATH = DEVICE_DB_DIR / "devices.db"
+    DB_GIT_DIR: Path | None = DEVICE_DB_DIR
+elif PTOUCH_DIR.is_dir():
+    DB_PATH = PTOUCH_DIR / "labels.db"          # Übergangs-Fallback
+    DB_GIT_DIR = PTOUCH_DIR
 else:
     # Stable per-user location so the fallback DB survives across runs. With a
     # packaged (PyInstaller onefile) build SCRIPT_DIR is a temp extraction dir,
@@ -1695,7 +1698,7 @@ class WifiButtonBuilder(tk.Tk):
         except Exception as e:
             messagebox.showerror("DB-Fehler", str(e))
             return
-        where = "ptouch/labels.db" if DB_GIT_DIR else DB_PATH.name
+        where = f"{DB_GIT_DIR.name}/{DB_PATH.name}" if DB_GIT_DIR else DB_PATH.name
         wb_git_push(f"wifi-button: {mac} {cfg.get('device_name', '')} (manuell)")
         self.mac_var.set(mac)
         self.status_var.set(f"In DB gespeichert ({where}): {mac}")
@@ -2118,7 +2121,7 @@ class WifiButtonBuilder(tk.Tk):
             messagebox.showerror("DB-Fehler", str(e))
             return
         verb = "aktualisiert" if result == "updated" else "neu angelegt"
-        where = "ptouch/labels.db" if DB_GIT_DIR else DB_PATH.name
+        where = f"{DB_GIT_DIR.name}/{DB_PATH.name}" if DB_GIT_DIR else DB_PATH.name
         wb_git_push(f"wifi-button: {mac} aus Taster ausgelesen ({verb})")
         self.mac_var.set(mac)
         self.status_var.set(f"DB {verb} ({where}): {mac}")
@@ -2141,7 +2144,7 @@ class WifiButtonBuilder(tk.Tk):
         except Exception as e:
             log_cb(f"⚠ DB-Eintrag fehlgeschlagen: {e}")
             return
-        where = "ptouch/labels.db" if DB_GIT_DIR else DB_PATH.name
+        where = f"{DB_GIT_DIR.name}/{DB_PATH.name}" if DB_GIT_DIR else DB_PATH.name
         log_cb(f"✓ In DB gespeichert ({where}): {mac}")
         wb_git_push(f"wifi-button: {mac} {cfg.get('device_name', '')} geflasht")
         # Marshal the UI refresh onto the main thread via the status queue.
