@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import queue
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qsl, quote
@@ -141,6 +142,12 @@ CREATE TABLE IF NOT EXISTS wifi_buttons (
 """
 
 
+# Serialisiert JEDEN DB-Zugriff gegen den git-Sync-Thread. Ohne den Lock kann
+# ein `git pull --rebase` (wb_git_pull/-push laufen im Hintergrund) die .db-Datei
+# unter einer offenen SQLite-Verbindung austauschen → stale reads bis Korruption.
+_DB_LOCK = threading.RLock()
+
+
 def wb_db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
     con.executescript(WB_SCHEMA)
@@ -153,16 +160,35 @@ def wb_db() -> sqlite3.Connection:
     return con
 
 
+@contextmanager
+def wb_conn():
+    """Verbindung mit garantiertem close() und Lock gegen den git-Sync-Thread.
+
+    Alle DB-Helfer laufen hierüber: früher blieb bei einer Exception mitten in
+    einer Query die Verbindung offen (und damit die Datei gelockt)."""
+    with _DB_LOCK:
+        con = wb_db()
+        try:
+            yield con
+        finally:
+            con.close()
+
+
+def _norm_mac(mac: str) -> str:
+    """MACs sind in der DB durchgängig uppercase — jeder Zugriff normalisiert."""
+    return (mac or "").strip().upper()
+
+
 def wb_register(mac: str, cfg: dict, ino: str = "") -> None:
     """Insert or update a device's full config (+ generated .ino), keyed by MAC."""
-    mac = mac.upper()
+    mac = _norm_mac(mac)
     now = datetime.now().isoformat(timespec="seconds")
     ip = cfg.get("static_ip", "") if cfg.get("ip_mode") == "static" else "DHCP"
     buttons = json.dumps(cfg.get("buttons", []), ensure_ascii=False)
     config_json = json.dumps(cfg, ensure_ascii=False)
-    con = wb_db()
-    con.execute(
-        """
+    with wb_conn() as con:
+        con.execute(
+            """
         INSERT INTO wifi_buttons
             (mac, customer, location, device_name, ip_mode, ip, gateway,
              subnet, dns, wifi_ssid, wifi_password, buttons, config_json, ino,
@@ -185,14 +211,13 @@ def wb_register(mac: str, cfg: dict, ino: str = "") -> None:
             last_flashed  = excluded.last_flashed,
             flash_count   = wifi_buttons.flash_count + 1
         """,
-        (mac, cfg.get("customer", ""), cfg.get("location", ""),
-         cfg.get("device_name", ""), cfg.get("ip_mode", ""), ip,
-         cfg.get("gateway", ""), cfg.get("subnet", ""), cfg.get("dns", ""),
-         cfg.get("wifi_ssid", ""), cfg.get("wifi_password", ""),
-         buttons, config_json, ino, now, now),
-    )
-    con.commit()
-    con.close()
+            (mac, cfg.get("customer", ""), cfg.get("location", ""),
+             cfg.get("device_name", ""), cfg.get("ip_mode", ""), ip,
+             cfg.get("gateway", ""), cfg.get("subnet", ""), cfg.get("dns", ""),
+             cfg.get("wifi_ssid", ""), cfg.get("wifi_password", ""),
+             buttons, config_json, ino, now, now),
+        )
+        con.commit()
 
 
 def wb_update_from_read(mac: str, read_cfg: dict) -> str:
@@ -200,56 +225,54 @@ def wb_update_from_read(mac: str, read_cfg: dict) -> str:
     übernehmen. Metadaten (Kunde/Standort/Gerätename), Passwort und flash_count
     bleiben unangetastet — das Base-Image gibt sie nicht aus. Gibt 'updated' für
     einen vorhandenen bzw. 'created' für einen neu angelegten Eintrag zurück."""
-    mac = mac.upper()
+    mac = _norm_mac(mac)
     existing = wb_get_config(mac) or {}
     merged = {**existing, **read_cfg}
     ip = merged.get("static_ip", "") if merged.get("ip_mode") == "static" else "DHCP"
     buttons = json.dumps(merged.get("buttons", []), ensure_ascii=False)
     config_json = json.dumps(merged, ensure_ascii=False)
-    con = wb_db()
-    found = con.execute("SELECT 1 FROM wifi_buttons WHERE mac=?", (mac,)).fetchone()
-    if found:
-        con.execute(
-            """UPDATE wifi_buttons SET
-                   ip_mode=?, ip=?, gateway=?, subnet=?, dns=?, wifi_ssid=?,
-                   buttons=?, config_json=?
-               WHERE mac=?""",
-            (merged.get("ip_mode", ""), ip, merged.get("gateway", ""),
-             merged.get("subnet", ""), merged.get("dns", ""),
-             merged.get("wifi_ssid", ""), buttons, config_json, mac),
-        )
-        result = "updated"
-    else:
-        now = datetime.now().isoformat(timespec="seconds")
-        con.execute(
-            """INSERT INTO wifi_buttons
-                   (mac, customer, location, device_name, ip_mode, ip, gateway,
-                    subnet, dns, wifi_ssid, wifi_password, buttons, config_json,
-                    ino, first_seen, last_flashed, flash_count, notes)
-               VALUES (?,'','','',?,?,?,?,?,?,'',?,?,'',?,NULL,0,'')""",
-            (mac, merged.get("ip_mode", ""), ip, merged.get("gateway", ""),
-             merged.get("subnet", ""), merged.get("dns", ""),
-             merged.get("wifi_ssid", ""), buttons, config_json, now),
-        )
-        result = "created"
-    con.commit()
-    con.close()
+    with wb_conn() as con:
+        found = con.execute(
+            "SELECT 1 FROM wifi_buttons WHERE mac=?", (mac,)).fetchone()
+        if found:
+            con.execute(
+                """UPDATE wifi_buttons SET
+                       ip_mode=?, ip=?, gateway=?, subnet=?, dns=?, wifi_ssid=?,
+                       buttons=?, config_json=?
+                   WHERE mac=?""",
+                (merged.get("ip_mode", ""), ip, merged.get("gateway", ""),
+                 merged.get("subnet", ""), merged.get("dns", ""),
+                 merged.get("wifi_ssid", ""), buttons, config_json, mac),
+            )
+            result = "updated"
+        else:
+            now = datetime.now().isoformat(timespec="seconds")
+            con.execute(
+                """INSERT INTO wifi_buttons
+                       (mac, customer, location, device_name, ip_mode, ip, gateway,
+                        subnet, dns, wifi_ssid, wifi_password, buttons, config_json,
+                        ino, first_seen, last_flashed, flash_count, notes)
+                   VALUES (?,'','','',?,?,?,?,?,?,'',?,?,'',?,NULL,0,'')""",
+                (mac, merged.get("ip_mode", ""), ip, merged.get("gateway", ""),
+                 merged.get("subnet", ""), merged.get("dns", ""),
+                 merged.get("wifi_ssid", ""), buttons, config_json, now),
+            )
+            result = "created"
+        con.commit()
     return result
 
 
 def _wb_rows(where: str = "", params: tuple = ()) -> list[tuple]:
-    con = wb_db()
-    rows = con.execute(
-        "SELECT COALESCE(customer,''), COALESCE(location,''), mac, "
-        "device_name, ip, wifi_ssid, buttons, "
-        "COALESCE(last_flashed,'—'), flash_count, COALESCE(notes,'') "
-        f"FROM wifi_buttons {where} "
-        "ORDER BY customer COLLATE NOCASE, location COLLATE NOCASE, "
-        "device_name COLLATE NOCASE",
-        params,
-    ).fetchall()
-    con.close()
-    return rows
+    with wb_conn() as con:
+        return con.execute(
+            "SELECT COALESCE(customer,''), COALESCE(location,''), mac, "
+            "device_name, ip, wifi_ssid, buttons, "
+            "COALESCE(last_flashed,'—'), flash_count, COALESCE(notes,'') "
+            f"FROM wifi_buttons {where} "
+            "ORDER BY customer COLLATE NOCASE, location COLLATE NOCASE, "
+            "device_name COLLATE NOCASE",
+            params,
+        ).fetchall()
 
 
 def wb_all() -> list[tuple]:
@@ -285,20 +308,17 @@ def wb_export_rows(query: str = "") -> list[tuple]:
     )
     order = (" ORDER BY customer COLLATE NOCASE, location COLLATE NOCASE, "
              "device_name COLLATE NOCASE")
-    con = wb_db()
-    if query:
-        like = f"%{query}%"
-        rows = con.execute(
-            select +
-            "WHERE customer LIKE ? OR location LIKE ? OR mac LIKE ? "
-            "OR device_name LIKE ? OR ip LIKE ? OR wifi_ssid LIKE ? "
-            "OR buttons LIKE ? OR COALESCE(notes,'') LIKE ?" + order,
-            (like, like, like, like, like, like, like, like),
-        ).fetchall()
-    else:
-        rows = con.execute(select + order).fetchall()
-    con.close()
-    return rows
+    with wb_conn() as con:
+        if query:
+            like = f"%{query}%"
+            return con.execute(
+                select +
+                "WHERE customer LIKE ? OR location LIKE ? OR mac LIKE ? "
+                "OR device_name LIKE ? OR ip LIKE ? OR wifi_ssid LIKE ? "
+                "OR buttons LIKE ? OR COALESCE(notes,'') LIKE ?" + order,
+                (like, like, like, like, like, like, like, like),
+            ).fetchall()
+        return con.execute(select + order).fetchall()
 
 
 # ── DB export / import (verlustfreies JSON, MAC-keyed Merge) ────────────────────
@@ -318,12 +338,11 @@ WB_EXPORT_VERSION = 1
 
 def wb_full_row(mac: str) -> dict | None:
     """Full per-device record as a dict, keyed by MAC (None if unknown)."""
-    con = wb_db()
-    row = con.execute(
-        f"SELECT {', '.join(WB_ALL_COLS)} FROM wifi_buttons WHERE mac=?",
-        (mac.upper(),),
-    ).fetchone()
-    con.close()
+    with wb_conn() as con:
+        row = con.execute(
+            f"SELECT {', '.join(WB_ALL_COLS)} FROM wifi_buttons WHERE mac=?",
+            (_norm_mac(mac),),
+        ).fetchone()
     return dict(zip(WB_ALL_COLS, row)) if row else None
 
 
@@ -367,61 +386,67 @@ def wb_import_records(records: list[dict],
     On conflict the incoming content overwrites, but first_seen and the higher
     flash_count are kept so local history survives. Records without a MAC are
     skipped."""
-    selected = {m.upper() for m in selected_macs}
+    selected = {_norm_mac(m) for m in selected_macs}
     added = updated = 0
-    con = wb_db()
     now = datetime.now().isoformat(timespec="seconds")
-    for rec in records:
-        mac = (rec.get("mac") or "").upper()
-        if not mac or mac not in selected:
-            continue
-        exists = con.execute(
-            "SELECT 1 FROM wifi_buttons WHERE mac=?", (mac,)).fetchone()
-        vals = {c: _import_text(rec, c) for c in WB_CONTENT_COLS}
-        first_seen = rec.get("first_seen") or now
-        last_flashed = rec.get("last_flashed") or now
-        flash_count = int(rec.get("flash_count") or 0)
-        con.execute(
-            f"""
-            INSERT INTO wifi_buttons
-                ({', '.join(WB_ALL_COLS)})
-            VALUES ({', '.join('?' for _ in WB_ALL_COLS)})
-            ON CONFLICT(mac) DO UPDATE SET
-                {', '.join(f'{c}=excluded.{c}' for c in WB_CONTENT_COLS)},
-                last_flashed = MAX(COALESCE(wifi_buttons.last_flashed,''),
-                                   COALESCE(excluded.last_flashed,'')),
-                flash_count  = MAX(wifi_buttons.flash_count, excluded.flash_count)
-            """,
-            (mac, vals["customer"], vals["location"], vals["device_name"],
-             vals["ip_mode"], vals["ip"], vals["gateway"], vals["subnet"],
-             vals["dns"], vals["wifi_ssid"], vals["wifi_password"],
-             vals["buttons"], vals["config_json"], vals["ino"],
-             first_seen, last_flashed, flash_count, vals["notes"]),
-        )
-        if exists:
-            updated += 1
-        else:
-            added += 1
-    con.commit()
-    con.close()
+    with wb_conn() as con:
+        for rec in records:
+            mac = _norm_mac(rec.get("mac") or "")
+            if not mac or mac not in selected:
+                continue
+            exists = con.execute(
+                "SELECT 1 FROM wifi_buttons WHERE mac=?", (mac,)).fetchone()
+            vals = {c: _import_text(rec, c) for c in WB_CONTENT_COLS}
+            first_seen = rec.get("first_seen") or now
+            last_flashed = rec.get("last_flashed") or now
+            # Fremddatei: flash_count darf Müll sein und den Import nicht kippen.
+            try:
+                flash_count = int(rec.get("flash_count") or 0)
+            except (TypeError, ValueError):
+                flash_count = 0
+            con.execute(
+                f"""
+                INSERT INTO wifi_buttons
+                    ({', '.join(WB_ALL_COLS)})
+                VALUES ({', '.join('?' for _ in WB_ALL_COLS)})
+                ON CONFLICT(mac) DO UPDATE SET
+                    {', '.join(f'{c}=excluded.{c}' for c in WB_CONTENT_COLS)},
+                    last_flashed = MAX(COALESCE(wifi_buttons.last_flashed,''),
+                                       COALESCE(excluded.last_flashed,'')),
+                    flash_count  = MAX(wifi_buttons.flash_count, excluded.flash_count)
+                """,
+                (mac, vals["customer"], vals["location"], vals["device_name"],
+                 vals["ip_mode"], vals["ip"], vals["gateway"], vals["subnet"],
+                 vals["dns"], vals["wifi_ssid"], vals["wifi_password"],
+                 vals["buttons"], vals["config_json"], vals["ino"],
+                 first_seen, last_flashed, flash_count, vals["notes"]),
+            )
+            if exists:
+                updated += 1
+            else:
+                added += 1
+        con.commit()
     return added, updated
 
 
 def wb_get_config(mac: str) -> dict | None:
-    con = wb_db()
-    row = con.execute(
-        "SELECT config_json FROM wifi_buttons WHERE mac=?", (mac,)
-    ).fetchone()
-    con.close()
-    return json.loads(row[0]) if row and row[0] else None
+    with wb_conn() as con:
+        row = con.execute(
+            "SELECT config_json FROM wifi_buttons WHERE mac=?", (_norm_mac(mac),)
+        ).fetchone()
+    if not (row and row[0]):
+        return None
+    try:
+        return json.loads(row[0])
+    except json.JSONDecodeError:
+        return None
 
 
 def wb_get_ino(mac: str) -> str:
-    con = wb_db()
-    row = con.execute(
-        "SELECT ino FROM wifi_buttons WHERE mac=?", (mac,)
-    ).fetchone()
-    con.close()
+    with wb_conn() as con:
+        row = con.execute(
+            "SELECT ino FROM wifi_buttons WHERE mac=?", (_norm_mac(mac),)
+        ).fetchone()
     return (row[0] or "") if row else ""
 
 
@@ -434,22 +459,25 @@ def wb_distinct(column: str) -> list[str]:
     """Distinct non-empty values for a column, newest-first (for dropdowns)."""
     if column not in _DISTINCT_OK:
         return []
-    con = wb_db()
-    rows = con.execute(
-        f"SELECT {column}, MAX(last_flashed) m FROM wifi_buttons "
-        f"WHERE {column} IS NOT NULL AND {column} != '' "
-        f"GROUP BY {column} ORDER BY m DESC"
-    ).fetchall()
-    con.close()
-    return [r[0] for r in rows]
+    with wb_conn() as con:
+        rows = con.execute(
+            f"SELECT {column}, MAX(last_flashed) m FROM wifi_buttons "
+            f"WHERE {column} IS NOT NULL AND {column} != '' "
+            f"GROUP BY {column} ORDER BY m DESC"
+        ).fetchall()
+    vals = [r[0] for r in rows]
+    if column == "ip":
+        # Die ip-Spalte hält für DHCP-Geräte den Literalstring "DHCP" — der darf
+        # nicht als Vorschlag (oder gar Prefill) im Static-IP-Feld landen.
+        vals = [v for v in vals if v != "DHCP"]
+    return vals
 
 
 def wb_macs() -> list[str]:
-    con = wb_db()
-    rows = con.execute(
-        "SELECT mac FROM wifi_buttons ORDER BY last_flashed DESC"
-    ).fetchall()
-    con.close()
+    with wb_conn() as con:
+        rows = con.execute(
+            "SELECT mac FROM wifi_buttons ORDER BY last_flashed DESC"
+        ).fetchall()
     return [r[0] for r in rows]
 
 
@@ -465,18 +493,18 @@ def wb_mac_labels() -> dict[str, str]:
     Kunde/Standort come from the builder (wifi_buttons); the Tasterort (the
     label text assigned in the ptouch tool, e.g. 'Eisenwaren Info') comes from
     devices.freetext. Either part may be missing."""
-    con = wb_db()
     kunde_ort: dict[str, str] = {}
-    for mac, cust, loc in con.execute(
-            "SELECT mac, COALESCE(customer,''), COALESCE(location,'') FROM wifi_buttons"):
-        kunde_ort[mac] = " / ".join(x for x in (cust, loc) if x)
     tasterort: dict[str, str] = {}
-    if _devices_table_exists(con):
-        for mac, free in con.execute(
-                "SELECT mac, COALESCE(freetext,'') FROM devices"):
-            if free:
-                tasterort[mac] = free
-    con.close()
+    with wb_conn() as con:
+        for mac, cust, loc in con.execute(
+                "SELECT mac, COALESCE(customer,''), COALESCE(location,'') "
+                "FROM wifi_buttons"):
+            kunde_ort[_norm_mac(mac)] = " / ".join(x for x in (cust, loc) if x)
+        if _devices_table_exists(con):
+            for mac, free in con.execute(
+                    "SELECT mac, COALESCE(freetext,'') FROM devices"):
+                if free:
+                    tasterort[_norm_mac(mac)] = free
     labels: dict[str, str] = {}
     for mac in set(kunde_ort) | set(tasterort):
         parts = [p for p in (kunde_ort.get(mac, ""), tasterort.get(mac, "")) if p]
@@ -489,11 +517,10 @@ def wb_get_meta(mac: str) -> tuple[str, str]:
 
     Note: the ptouch freetext is the *Tasterort* (button position), NOT the
     city, so it is deliberately not used to fill the Standort field here."""
-    con = wb_db()
-    row = con.execute(
-        "SELECT COALESCE(customer,''), COALESCE(location,'') "
-        "FROM wifi_buttons WHERE mac=?", (mac,)).fetchone()
-    con.close()
+    with wb_conn() as con:
+        row = con.execute(
+            "SELECT COALESCE(customer,''), COALESCE(location,'') "
+            "FROM wifi_buttons WHERE mac=?", (_norm_mac(mac),)).fetchone()
     return row if row else ("", "")
 
 
@@ -506,60 +533,71 @@ def suggest_device_name(mac: str) -> str:
 
 
 def wb_delete(mac: str) -> None:
-    con = wb_db()
-    con.execute("DELETE FROM wifi_buttons WHERE mac=?", (mac,))
-    con.commit()
-    con.close()
+    with wb_conn() as con:
+        con.execute("DELETE FROM wifi_buttons WHERE mac=?", (_norm_mac(mac),))
+        con.commit()
 
 
 def wb_set_notes(mac: str, notes: str) -> None:
-    con = wb_db()
-    con.execute("UPDATE wifi_buttons SET notes=? WHERE mac=?", (notes, mac))
-    con.commit()
-    con.close()
+    with wb_conn() as con:
+        con.execute("UPDATE wifi_buttons SET notes=? WHERE mac=?",
+                    (notes, _norm_mac(mac)))
+        con.commit()
+
+
+def wb_get_notes(mac: str) -> str:
+    with wb_conn() as con:
+        row = con.execute("SELECT COALESCE(notes,'') FROM wifi_buttons WHERE mac=?",
+                          (_norm_mac(mac),)).fetchone()
+    return row[0] if row else ""
 
 
 def wb_git_pull() -> None:
-    """Pull the latest DB from the ptouch remote (silent, non-fatal)."""
+    """Pull the latest DB from the shared remote (silent, non-fatal).
+
+    Unter _DB_LOCK: ein Rebase schreibt die .db-Datei neu, das darf nicht
+    parallel zu einer offenen SQLite-Verbindung passieren."""
     if DB_GIT_DIR is None:
         return
     try:
-        subprocess.run(
-            ["git", "-C", str(DB_GIT_DIR), "pull", "--rebase",
-             "--autostash", "--quiet"],
-            check=False, timeout=15, capture_output=True,
-            creationflags=_NO_WINDOW)
+        with _DB_LOCK:
+            subprocess.run(
+                ["git", "-C", str(DB_GIT_DIR), "pull", "--rebase",
+                 "--autostash", "--quiet"],
+                check=False, timeout=15, capture_output=True,
+                creationflags=_NO_WINDOW)
     except Exception:
         pass
 
 
 def wb_git_push(message: str) -> None:
-    """Commit + push the DB (async, fire-and-forget) via the ptouch repo."""
+    """Commit + push the DB (async, fire-and-forget) via the shared repo."""
     if DB_GIT_DIR is None:
         return
 
     def _run():
         try:
-            r = subprocess.run(
-                ["git", "-C", str(DB_GIT_DIR), "add", str(DB_PATH)],
-                capture_output=True, timeout=10, creationflags=_NO_WINDOW)
-            if r.returncode != 0:
-                return
-            r = subprocess.run(
-                ["git", "-C", str(DB_GIT_DIR), "diff", "--cached", "--quiet"],
-                capture_output=True, creationflags=_NO_WINDOW)
-            if r.returncode == 0:
-                return  # nothing staged
-            subprocess.run(
-                ["git", "-C", str(DB_GIT_DIR), "commit", "-m", message],
-                capture_output=True, timeout=10, creationflags=_NO_WINDOW)
-            subprocess.run(
-                ["git", "-C", str(DB_GIT_DIR), "pull", "--rebase",
-                 "--autostash", "--quiet"],
-                capture_output=True, timeout=15, creationflags=_NO_WINDOW)
-            subprocess.run(
-                ["git", "-C", str(DB_GIT_DIR), "push", "--quiet"],
-                capture_output=True, timeout=20, creationflags=_NO_WINDOW)
+            with _DB_LOCK:
+                r = subprocess.run(
+                    ["git", "-C", str(DB_GIT_DIR), "add", str(DB_PATH)],
+                    capture_output=True, timeout=10, creationflags=_NO_WINDOW)
+                if r.returncode != 0:
+                    return
+                r = subprocess.run(
+                    ["git", "-C", str(DB_GIT_DIR), "diff", "--cached", "--quiet"],
+                    capture_output=True, creationflags=_NO_WINDOW)
+                if r.returncode == 0:
+                    return  # nothing staged
+                subprocess.run(
+                    ["git", "-C", str(DB_GIT_DIR), "commit", "-m", message],
+                    capture_output=True, timeout=10, creationflags=_NO_WINDOW)
+                subprocess.run(
+                    ["git", "-C", str(DB_GIT_DIR), "pull", "--rebase",
+                     "--autostash", "--quiet"],
+                    capture_output=True, timeout=15, creationflags=_NO_WINDOW)
+                subprocess.run(
+                    ["git", "-C", str(DB_GIT_DIR), "push", "--quiet"],
+                    capture_output=True, timeout=20, creationflags=_NO_WINDOW)
         except Exception:
             pass
 
@@ -662,36 +700,114 @@ def _config_set_pairs(cfg: dict):
     return pairs
 
 
+# Alle Serial-Dialoge laufen über Deadline-Schleifen statt über ein einzelnes
+# read() nach festem sleep(): `ser.read(ser.in_waiting or 1)` liefert genau EIN
+# Byte, wenn der Puffer im Moment des Aufrufs leer ist — die Antwort galt dann
+# fälschlich als ausgeblieben. Der Port wird deshalb mit kurzem Timeout geöffnet.
+_SERIAL_TIMEOUT = 0.1
+
+
+def _read_until(ser, needle: str, timeout: float) -> str:
+    """Liest bis `needle` im Empfangenen steht oder `timeout` abläuft.
+    Gibt immer alles Gelesene zurück (auch im Timeout-Fall)."""
+    buf = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        chunk = ser.read(ser.in_waiting or 1).decode(errors="ignore")
+        if chunk:
+            buf += chunk
+            if needle in buf:
+                break
+        else:
+            time.sleep(0.02)
+    return buf
+
+
+def _open_config_port(ser) -> None:
+    """DTR/RTS assertieren — NICHT als Reset, sondern als CDC-Verbindungssignal.
+
+    Das Base-Image verlässt den Config-Modus bei `if (!Serial) return false;`.
+    Auf dem ESP32-C6 (USB CDC On Boot) spiegelt Arduinos `Serial`-bool die
+    DTR-Leitung: ohne gesetztes DTR hält das Board die USB-Verbindung für weg
+    und geht sofort schlafen. Ein *Reset* ist über DTR/RTS dagegen nicht
+    möglich (dafür bräuchte es die esptool-JTAG-Sequenz) — ein bereits
+    eingeschlafenes Board holt nur die RESET-Taste zurück."""
+    try:
+        ser.dtr = True
+        ser.rts = True
+    except Exception:
+        pass
+    time.sleep(0.2)
+
+
+def _handshake(ser, log_cb) -> bool:
+    """VER?-Handshake mit Deadline und einem Wiederholungsversuch."""
+    _open_config_port(ser)
+    resp = ""
+    for attempt in (1, 2):
+        ser.reset_input_buffer()
+        ser.write(b"VER?\n")
+        resp = _read_until(ser, "VER wbtn", 2.5)
+        if "VER wbtn" in resp:
+            line = next((l for l in resp.splitlines() if "VER wbtn" in l), resp)
+            log_cb(f"✓ Base-Image erkannt: {line.strip()}")
+            return True
+        if attempt == 1:
+            log_cb("… keine Antwort, zweiter Versuch …")
+    log_cb("✗ Keine Antwort vom Base-Image (VER?).")
+    if not resp.strip():
+        log_cb("  Das Board ist komplett stumm — es schläft vermutlich (Deep Sleep).")
+        log_cb("  Der Builder kann einen ESP32-C6 nicht per Software aufwecken.")
+        log_cb("  → RESET-Taste drücken (oder ab-/anstecken) und innerhalb von")
+        log_cb("    60 s erneut senden.")
+    else:
+        log_cb(f"  Empfangen wurde: {resp.strip()[:200]}")
+        log_cb("  Das sieht nicht nach dem Base-Image aus — falsche Firmware?")
+    return False
+
+
+def _bad_serial_values(pairs) -> list[str]:
+    """Werte, die das zeilenbasierte Protokoll zerlegen würden (CR/LF)."""
+    return [k for k, v in pairs if isinstance(v, str) and ("\n" in v or "\r" in v)]
+
+
 def send_config_serial(port: str, cfg: dict, log_cb) -> bool:
     """Config per USB-Serial ins Base-Image-NVS schreiben (SET/SAVE) — kein
     Recompile/Flash. Setzt voraus, dass das generische Base-Image geflasht ist
-    (ptouch) und das Board im Config-Modus lauscht (frisch geflasht / Reset)."""
+    und das Board im Config-Modus lauscht (frisch geflasht / Reset)."""
     import serial as _serial
+    pairs = _config_set_pairs(cfg)
+    bad = _bad_serial_values(pairs)
+    if bad:
+        log_cb(f"✗ Zeilenumbruch in Feld(ern): {', '.join(bad)} — nicht übertragbar.")
+        return False
     try:
-        with _serial.Serial(port, 115200, timeout=2) as ser:
-            # Best-effort Reset über DTR -> Board bootet in den Config-Modus
-            try:
-                ser.dtr = False; time.sleep(0.1); ser.dtr = True
-            except Exception:
-                pass
-            time.sleep(1.8)
-            ser.reset_input_buffer()
-            ser.write(b"VER?\n"); time.sleep(0.4)
-            resp = ser.read(ser.in_waiting or 1).decode(errors="ignore")
-            if "VER wbtn" not in resp:
-                log_cb("✗ Keine Antwort vom Base-Image (VER?).")
-                log_cb("  Base-Image geflasht? (ptouch) Board kurz RESET/neu anstecken.")
+        with _serial.Serial(port, 115200, timeout=_SERIAL_TIMEOUT) as ser:
+            if not _handshake(ser, log_cb):
                 return False
-            log_cb(f"✓ Base-Image erkannt: {resp.strip()}")
-            for k, v in _config_set_pairs(cfg):
-                ser.write(f"SET {k} {v}\n".encode()); time.sleep(0.04)
-                ser.read(ser.in_waiting or 0)
-            ser.write(b"SAVE\n"); time.sleep(0.6)
-            resp = ser.read(ser.in_waiting or 1).decode(errors="ignore")
+            # Jede SET-Quittung auswerten: das Base-Image antwortet "OK" bzw.
+            # "ERR set". Früher wurde gar nicht gelesen — abgelehnte Werte
+            # blieben unsichtbar und der Techniker las trotzdem "✓ gespeichert".
+            failed = []
+            for k, v in pairs:
+                ser.reset_input_buffer()
+                ser.write(f"SET {k} {v}\n".encode())
+                resp = _read_until(ser, "\n", 1.0)
+                if "OK" not in resp:
+                    failed.append(f"{k} = {v!r} → {resp.strip() or '(keine Antwort)'}")
+            if failed:
+                log_cb(f"✗ {len(failed)} Wert(e) vom Board abgelehnt — nicht gespeichert:")
+                for entry in failed:
+                    log_cb(f"    {entry}")
+                return False
+            ser.reset_input_buffer()
+            ser.write(b"SAVE\n")
+            resp = _read_until(ser, "OK saved", 3.0)
             if "OK saved" in resp:
-                log_cb("✓ Config ins NVS gespeichert. Button einsatzbereit.")
+                log_cb(f"✓ {len(pairs)} Werte übertragen und ins NVS gespeichert.")
+                log_cb("✓ Button einsatzbereit.")
                 return True
-            log_cb(f"⚠ Unerwartete SAVE-Antwort: {resp.strip()}")
+            log_cb(f"⚠ Unerwartete SAVE-Antwort: {resp.strip() or '(keine)'}")
             return False
     except Exception as e:
         log_cb(f"✗ Serial-Fehler: {e}")
@@ -767,6 +883,7 @@ def stream_serial_log(port: str, log_cb, stop_event: threading.Event,
     import serial as _serial
     try:
         with _serial.Serial(port, 115200, timeout=0.1) as ser:
+            _open_config_port(ser)   # ohne DTR hält das Board USB für getrennt
             log_cb(f"[Verbunden · {port} · 115200 Baud]")
             buf = b""
             while not stop_event.is_set():
@@ -797,33 +914,12 @@ def read_config_serial(port: str, log_cb) -> dict | None:
     voraus. Gibt ein (Teil-)Config-Dict zurück oder None bei Fehler."""
     import serial as _serial
     try:
-        with _serial.Serial(port, 115200, timeout=2) as ser:
-            # Best-effort Reset über DTR -> Board bootet in den Config-Modus
-            try:
-                ser.dtr = False; time.sleep(0.1); ser.dtr = True
-            except Exception:
-                pass
-            time.sleep(1.8)
-            ser.reset_input_buffer()
-            ser.write(b"VER?\n"); time.sleep(0.4)
-            resp = ser.read(ser.in_waiting or 1).decode(errors="ignore")
-            if "VER wbtn" not in resp:
-                log_cb("✗ Keine Antwort vom Base-Image (VER?).")
-                log_cb("  Base-Image geflasht? (ptouch) Board kurz RESET/neu anstecken.")
+        with _serial.Serial(port, 115200, timeout=_SERIAL_TIMEOUT) as ser:
+            if not _handshake(ser, log_cb):
                 return None
-            log_cb(f"✓ Base-Image erkannt: {resp.strip()}")
             ser.reset_input_buffer()
             ser.write(b"CFG?\n")
-            buf = ""
-            deadline = time.time() + 4
-            while time.time() < deadline:
-                chunk = ser.read(ser.in_waiting or 1).decode(errors="ignore")
-                if chunk:
-                    buf += chunk
-                    if "END" in buf:
-                        break
-                else:
-                    time.sleep(0.05)
+            buf = _read_until(ser, "END", 4.0)
             cfg = _parse_dump(buf)
             if cfg is None:
                 log_cb("✗ Keine gültige CFG?-Antwort empfangen.")
@@ -876,6 +972,15 @@ def compose_action_url(host: str, webif_pass: str, request: str) -> str:
 # ── Code Generator ────────────────────────────────────────────────────────────
 
 
+def _c_str(value) -> str:
+    """Wert als Inhalt eines C-String-Literals escapen.
+
+    Ein Passwort oder eine SSID mit " oder \\ hat den generierten Sketch sonst
+    unkompilierbar gemacht (bzw. wäre aus dem Literal ausgebrochen)."""
+    return (str(value).replace("\\", "\\\\").replace('"', '\\"')
+            .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+
+
 def generate_ino(cfg: dict) -> str:
     """Generate Arduino .ino sketch from config dict (ESP32-C6 only)."""
     lines = []
@@ -883,20 +988,15 @@ def generate_ino(cfg: dict) -> str:
     def L(text=""):
         lines.append(text)
 
-    # Parse URLs into host/port/path for fire-and-forget
+    # Parse URLs into host/port/path for fire-and-forget. Bewusst dieselbe
+    # Zerlegung wie beim Serial-Pfad (_parse_button_url), damit .ino und NVS
+    # nicht auseinanderlaufen.
     parsed_urls = []
     for btn in cfg["buttons"]:
-        url = btn["url"]
-        m = re.match(r'https?://([^/:]+)(?::(\d+))?(/.*)$', url)
-        if m:
-            parsed_urls.append({
-                "host": m.group(1),
-                "port": int(m.group(2)) if m.group(2) else 80,
-                "path": m.group(3),
-                "method": btn.get("method", "GET"),
-            })
-        else:
-            parsed_urls.append({"host": "", "port": 80, "path": url, "method": btn.get("method", "GET")})
+        host, bport, path, meth = _parse_button_url(
+            btn.get("url", ""), btn.get("method", "GET"))
+        parsed_urls.append({"host": host, "port": bport, "path": path,
+                            "method": meth})
 
     L('#include <WiFi.h>')
     L('#include <esp_sleep.h>')
@@ -905,8 +1005,8 @@ def generate_ino(cfg: dict) -> str:
     L()
 
     L('// ---- Konfiguration ----')
-    L(f'const char* WIFI_SSID     = "{cfg["wifi_ssid"]}";')
-    L(f'const char* WIFI_PASSWORD = "{cfg["wifi_password"]}";')
+    L(f'const char* WIFI_SSID     = "{_c_str(cfg["wifi_ssid"])}";')
+    L(f'const char* WIFI_PASSWORD = "{_c_str(cfg["wifi_password"])}";')
     L()
 
     ip_mode = cfg.get("ip_mode", "static")
@@ -918,9 +1018,9 @@ def generate_ino(cfg: dict) -> str:
         L()
 
     for i, pu in enumerate(parsed_urls):
-        L(f'const char* HTTP_HOST_{i} = "{pu["host"]}";')
-        L(f'const int   HTTP_PORT_{i} = {pu["port"]};')
-        L(f'const char* HTTP_PATH_{i} = "{pu["path"]}";')
+        L(f'const char* HTTP_HOST_{i} = "{_c_str(pu["host"])}";')
+        L(f'const int   HTTP_PORT_{i} = {int(pu["port"])};')
+        L(f'const char* HTTP_PATH_{i} = "{_c_str(pu["path"])}";')
     L()
 
     L(f'const gpio_num_t WAKEUP_PIN = GPIO_NUM_{WAKEUP_GPIO};')
@@ -1088,7 +1188,7 @@ def generate_ino(cfg: dict) -> str:
     L('    }')
 
     for i, pu in enumerate(parsed_urls):
-        L(f'    sendHttpRequest(HTTP_HOST_{i}, HTTP_PORT_{i}, HTTP_PATH_{i}, "{pu["method"]}");')
+        L(f'    sendHttpRequest(HTTP_HOST_{i}, HTTP_PORT_{i}, HTTP_PATH_{i}, "{_c_str(pu["method"])}");')
 
     L()
     L('    repeatIndex++;')
@@ -1264,10 +1364,18 @@ class WifiButtonBuilder(tk.Tk):
 
     def _db_poller(self):
         """Background loop: pull the shared DB and refresh the UI on change."""
-        last_sig = None  # force one refresh on first pass
+        # Sentinel statt None: _db_signature() liefert selbst None, wenn die
+        # Datei (noch) fehlt — mit last_sig=None wäre der erste Durchlauf dann
+        # als "unverändert" durchgefallen und der Refresh nie gekommen.
+        last_sig = object()
+        tick = 0
         while True:
             try:
-                wb_git_pull()
+                # git pull ist ein Subprozess — nur alle 30 s statt alle 5 s.
+                # Der stat()-Vergleich läuft weiter im 5-s-Takt, damit lokale
+                # Änderungen (auch vom ptouch-Tool) zügig sichtbar werden.
+                if tick % 6 == 0:
+                    wb_git_pull()
                 sig = self._db_signature()
                 if sig != last_sig:
                     last_sig = sig
@@ -1275,6 +1383,7 @@ class WifiButtonBuilder(tk.Tk):
                     self.status_queue.put(("db_changed", None))
             except Exception:
                 pass
+            tick += 1
             time.sleep(5)
 
     def _init_style(self):
@@ -1442,12 +1551,27 @@ class WifiButtonBuilder(tk.Tk):
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
+        # bind_all gilt app-weit — auch für Toplevels. Ohne die Fenster-Prüfung
+        # scrollt das Rad im Vorschau-/Log-/Details-Fenster den Editor dahinter mit.
+        def _in_main_window(event) -> bool:
+            if self.view_var.get() != "editor":
+                return False
+            try:
+                return event.widget.winfo_toplevel() is self
+            except (AttributeError, tk.TclError):
+                return False
+
         def _on_mousewheel(event):
-            if self.view_var.get() == "editor":
+            if _in_main_window(event):
                 canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _on_button45(event, direction):
+            if _in_main_window(event):
+                canvas.yview_scroll(direction, "units")
+
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        canvas.bind_all("<Button-4>", lambda e: self.view_var.get() == "editor" and canvas.yview_scroll(-1, "units"))
-        canvas.bind_all("<Button-5>", lambda e: self.view_var.get() == "editor" and canvas.yview_scroll(1, "units"))
+        canvas.bind_all("<Button-4>", lambda e: _on_button45(e, -1))
+        canvas.bind_all("<Button-5>", lambda e: _on_button45(e, 1))
 
         # Aligned dashboard grid. Gerät spans full width; below it two equal,
         # flush card pairs — WiFi ↔ HTTP Aktionen and Timing&Wiederholung ↔
@@ -1712,10 +1836,13 @@ class WifiButtonBuilder(tk.Tk):
         if cfg["ip_mode"] == "static":
             for key, label in [("static_ip", "IP"), ("gateway", "Gateway"),
                                 ("subnet", "Subnet"), ("dns", "DNS")]:
+                # Bewusst IPv4Address statt ip_address: Letzteres akzeptiert
+                # auch IPv6 ("::1"), woraus generate_ino ein nicht
+                # kompilierbares IPAddress(::1) gebaut hätte.
                 try:
-                    ipaddress.ip_address(cfg[key])
-                except ValueError:
-                    errors.append(f'{label} ist keine gültige IP-Adresse: "{cfg[key]}"')
+                    ipaddress.IPv4Address(cfg[key].strip())
+                except (ipaddress.AddressValueError, AttributeError):
+                    errors.append(f'{label} ist keine gültige IPv4-Adresse: "{cfg[key]}"')
         for i, btn in enumerate(cfg["buttons"], 1):
             host, _pass, request = parse_action_url(btn.get("url", ""))
             if not host.strip():
@@ -1723,6 +1850,18 @@ class WifiButtonBuilder(tk.Tk):
             if not request.strip():
                 errors.append(f"Button {i}: Spot-Request darf nicht leer sein.")
         return errors
+
+    @staticmethod
+    def _spin_value(var: tk.IntVar, default: int) -> int:
+        """Wert einer Spinbox, robust gegen freien Text.
+
+        Spinboxen sind editierbar: bei leerem oder nicht-numerischem Inhalt
+        wirft IntVar.get() einen TclError. Ungefangen ist damit früher die
+        gesamte Aktion (z. B. "Config senden") kommentarlos gestorben."""
+        try:
+            return int(var.get())
+        except (tk.TclError, ValueError):
+            return default
 
     def _gather_config(self) -> dict:
         return {
@@ -1736,13 +1875,13 @@ class WifiButtonBuilder(tk.Tk):
             "gateway": self.ip_vars["gateway"].get(),
             "subnet": self.ip_vars["subnet"].get(),
             "dns": self.ip_vars["dns"].get(),
-            "wifi_timeout_s": self.timing_vars["wifi_timeout_s"].get(),
-            "http_timeout_s": self.timing_vars["http_timeout_s"].get(),
-            "cooldown_s": self.timing_vars["cooldown_s"].get(),
+            "wifi_timeout_s": self._spin_value(self.timing_vars["wifi_timeout_s"], 10),
+            "http_timeout_s": self._spin_value(self.timing_vars["http_timeout_s"], 3),
+            "cooldown_s": self._spin_value(self.timing_vars["cooldown_s"], 30),
             "wifi_tx_power": self.tx_power_var.get(),
             "wifi_power_save": self.power_save_var.get(),
-            "repeat_count": self.repeat_count_var.get(),
-            "repeat_interval_s": self.repeat_interval_var.get(),
+            "repeat_count": self._spin_value(self.repeat_count_var, 1),
+            "repeat_interval_s": self._spin_value(self.repeat_interval_var, 60),
             "buttons": [ed.get_data() for ed in self.button_editors],
         }
 
@@ -1825,9 +1964,22 @@ class WifiButtonBuilder(tk.Tk):
         path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All files", "*.*")])
         if not path:
             return
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        self._apply_config(cfg)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            messagebox.showerror("Datei nicht lesbar", f"{path}\n\n{e}")
+            return
+        if not isinstance(cfg, dict):
+            messagebox.showerror("Falsches Format",
+                                 "Die Datei enthält keine Button-Konfiguration.")
+            return
+        try:
+            self._apply_config(cfg)
+        except Exception as e:
+            messagebox.showerror("Config nicht übernehmbar", str(e))
+            return
+        self.status_var.set(f"Config geladen: {os.path.basename(path)}")
 
     def _apply_config(self, cfg: dict):
         self.device_name_var.set(cfg.get("device_name", "wifi-button"))
@@ -2153,7 +2305,10 @@ class WifiButtonBuilder(tk.Tk):
     # ── Inline device-DB panel (right pane) ───────────────────────────────
 
     def _build_db_panel(self, parent):
-        src = "geteilt: ptouch/labels.db" if DB_GIT_DIR else f"lokal: {DB_PATH.name}"
+        # Tatsächlichen Pfad zeigen — die feste Angabe "ptouch/labels.db" war
+        # seit der Migration auf device-db/devices.db schlicht falsch.
+        src = (f"geteilt (git): {DB_GIT_DIR.name}/{DB_PATH.name}" if DB_GIT_DIR
+               else f"lokal, ohne Sync: {DB_PATH}")
         f = ttk.LabelFrame(parent, text="Datenbank (Klick = in Editor laden)", padding=6)
         f.pack(fill="both", expand=True)
 
@@ -2321,11 +2476,8 @@ class WifiButtonBuilder(tk.Tk):
         if not mac:
             return
         from tkinter import simpledialog
-        con = wb_db()
-        row = con.execute("SELECT COALESCE(notes,'') FROM wifi_buttons WHERE mac=?", (mac,)).fetchone()
-        con.close()
         new = simpledialog.askstring("Notiz", f"Notiz für {mac}:",
-                                     initialvalue=row[0] if row else "", parent=self)
+                                     initialvalue=wb_get_notes(mac), parent=self)
         if new is None:
             return
         wb_set_notes(mac, new)

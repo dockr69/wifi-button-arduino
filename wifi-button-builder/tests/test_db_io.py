@@ -188,3 +188,54 @@ def test_parse_dump_roundtrips_firmware_output():
     ]
     assert "wifi_password" not in cfg                 # firmware never dumps it
     assert w._parse_dump("garbage with no kv pairs") is None
+
+
+# ── Regressionen aus dem Bug-Review ────────────────────────────────────────────
+
+
+def test_generate_ino_escapes_c_string_literals():
+    """Ein " oder \\ im Passwort hat den Sketch vorher unkompilierbar gemacht."""
+    cfg = dict(_cfg("btn"), wifi_password='pa"ss\\word', wifi_ssid='My "Net"',
+               wifi_timeout_s=10, http_timeout_s=3, wifi_tx_power="20dBm",
+               wifi_power_save=False)
+    code = w.generate_ino(cfg)
+    assert r'const char* WIFI_PASSWORD = "pa\"ss\\word";' in code
+    assert r'const char* WIFI_SSID     = "My \"Net\"";' in code
+    # Kein " bricht aus seinem Literal aus: jedes " ausser den beiden
+    # Begrenzern muss von einem Backslash eingeleitet sein.
+    for line in code.splitlines():
+        if not line.startswith("const char*"):
+            continue
+        body = line[line.index('"') + 1:line.rindex('"')]
+        assert all(body[i - 1] == "\\"
+                   for i, ch in enumerate(body) if ch == '"'), line
+
+
+def test_wb_distinct_ip_hides_dhcp_placeholder(fresh_db):
+    """Die ip-Spalte hält für DHCP-Geräte "DHCP" — das darf nicht als
+    Vorschlag/Prefill im Static-IP-Feld landen."""
+    w.wb_register("AA:BB:CC:00:00:01", _cfg("static-one", ip="192.168.2.50"))
+    dhcp = dict(_cfg("dhcp-one"), ip_mode="dhcp_cache")
+    w.wb_register("AA:BB:CC:00:00:02", dhcp)
+    assert w.wb_full_row("AA:BB:CC:00:00:02")["ip"] == "DHCP"   # so gespeichert
+    assert "DHCP" not in w.wb_distinct("ip")                     # aber nie angeboten
+    assert "192.168.2.50" in w.wb_distinct("ip")
+
+
+def test_db_helpers_normalise_mac_case(fresh_db):
+    w.wb_register("AA:BB:CC:00:00:01", _cfg("btn-1"), ino="// one")
+    # Kleingeschriebene MAC muss dieselbe Zeile treffen.
+    assert w.wb_get_config("aa:bb:cc:00:00:01")["device_name"] == "btn-1"
+    assert w.wb_get_ino("aa:bb:cc:00:00:01") == "// one"
+    assert w.wb_get_meta("aa:bb:cc:00:00:01") == ("ACME", "Halle")
+    w.wb_set_notes("aa:bb:cc:00:00:01", "Notiz")
+    assert w.wb_get_notes("AA:BB:CC:00:00:01") == "Notiz"
+    w.wb_delete("aa:bb:cc:00:00:01")
+    assert w.wb_full_row("AA:BB:CC:00:00:01") is None
+
+
+def test_import_survives_garbage_flash_count(fresh_db):
+    rec = {"mac": "AA:BB:CC:00:00:01", **_cfg("a"), "config_json": "{}",
+           "flash_count": "keine Zahl"}
+    assert w.wb_import_records([rec], {"AA:BB:CC:00:00:01"}) == (1, 0)
+    assert w.wb_full_row("AA:BB:CC:00:00:01")["flash_count"] == 0
