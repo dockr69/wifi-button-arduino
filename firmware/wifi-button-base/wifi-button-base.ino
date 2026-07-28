@@ -9,7 +9,8 @@
 //   MAC?            -> "MAC <aa:bb:..>"
 //   VER?            -> "VER wbtn <FW>"
 //   CFG?            -> aktuelle Config als key=val-Zeilen + "END"
-//   SET <key> <val> -> Wert puffern (Preferences)
+//   SET <key> <val> -> Wert puffern (Preferences); <val> darf leer sein
+//                      ("SET pass " loescht das Passwort -> offenes WLAN)
 //   SAVE            -> committen -> "OK saved"
 //   CLEAR           -> Config löschen -> "OK cleared"
 //   RUN             -> Config-Modus verlassen
@@ -23,13 +24,15 @@
 #include <Preferences.h>
 #include "esp_mac.h"
 
-#define FW_VERSION 1
+#define FW_VERSION 2
 #define MAX_BUTTONS 8
 
 // Hardcoded (Adafruit Feather ESP32-C6): A5/IO2 = RTC-GPIO, Taster gegen GND.
 static const int DEFAULT_WAKE_PIN = 2;
 static const unsigned long MAINTENANCE_HOLD_MS = 5000;
 static const unsigned long MAINTENANCE_MS = 60000;
+// Wie lange der Config-Modus bei angestecktem USB ohne Kommando offen bleibt.
+static const unsigned long CONFIG_IDLE_MS = 600000;  // 10 min
 
 // ---- Laufzeit-Config (aus NVS) ----
 Preferences prefs;
@@ -143,10 +146,13 @@ void dumpConfig() {
 }
 
 void handleSet(const String& rest) {
+  // Ein LEERER Wert ist gueltig ("SET pass " -> Passwort loeschen, offenes
+  // WLAN). Frueher fiel das auf "ERR set" und der alte NVS-Wert ueberlebte
+  // still — ein offenes WLAN liess sich damit gar nicht konfigurieren.
   int sp = rest.indexOf(' ');
-  if (sp < 0) { Serial.println("ERR set"); return; }
-  String key = rest.substring(0, sp);
-  String val = rest.substring(sp + 1);
+  String key = (sp < 0) ? rest : rest.substring(0, sp);
+  String val = (sp < 0) ? String("") : rest.substring(sp + 1);
+  if (!key.length()) { Serial.println("ERR set"); return; }
   prefs.begin("wbtn", false);
   // Typed keys -> richtige Preferences-Typen
   if (key == "wifitmo" || key == "httptmo" || key == "repint")
@@ -179,22 +185,26 @@ bool configMode() {
       char c = (char)Serial.read();
       lastActivity = millis();
       if (c == '\n' || c == '\r') {
-        line.trim();
-        if (line.length()) {
-          if (line == "MAC?") {
+        // Nur die KOPIE fuer den Kommandovergleich trimmen. Ein getrimmtes
+        // `line` haette SET-Werte beschaedigt (Passwoerter duerfen auf einem
+        // Leerzeichen enden) — deshalb geht an handleSet die Rohzeile.
+        String cmd = line;
+        cmd.trim();
+        if (cmd.length()) {
+          if (cmd == "MAC?") {
             Serial.printf("MAC %s\n", macStr().c_str());
-          } else if (line == "VER?") {
+          } else if (cmd == "VER?") {
             Serial.printf("VER wbtn %d\n", FW_VERSION);
-          } else if (line == "CFG?") {
+          } else if (cmd == "CFG?") {
             dumpConfig();
-          } else if (line == "SAVE") {
+          } else if (cmd == "SAVE") {
             loadConfig();
             Serial.println("OK saved");
-          } else if (line == "CLEAR") {
+          } else if (cmd == "CLEAR") {
             prefs.begin("wbtn", false); prefs.clear(); prefs.end();
             loadConfig();
             Serial.println("OK cleared");
-          } else if (line == "RUN") {
+          } else if (cmd == "RUN") {
             Serial.println("OK run");
             return true;
           } else if (line.startsWith("SET ")) {
@@ -209,7 +219,12 @@ bool configMode() {
       }
     }
     // Idle-Timeout nur für bereits konfigurierte Geräte (dann schlafen).
-    if (isConfigured() && millis() - lastActivity > MAINTENANCE_MS) return false;
+    // Bewusst grosszuegig (CONFIG_IDLE_MS, nicht MAINTENANCE_MS): der eigentliche
+    // Schutz gegen Batterie-Dauerlauf ist `!Serial` oben. Mit 60 s schlief ein
+    // Board, das der Techniker nur kurz liegen liess, waehrend der Arbeit ein —
+    // und ein ESP32-C6 (USB-Serial-JTAG) laesst sich vom Host NICHT per DTR/RTS
+    // aufwecken, d.h. nur die RESET-Taste holt es zurueck.
+    if (isConfigured() && millis() - lastActivity > CONFIG_IDLE_MS) return false;
     delay(10);
   }
 }
