@@ -16,6 +16,12 @@
 //   RUN             -> Config-Modus verlassen
 // USB angesteckt (Power-on/Reset) => Config-Modus. Batterie-Wake (GPIO/Timer)
 // => normaler Betrieb, NVS-Werte.
+//
+// Zwei Wege in den Config-Modus:
+//   1. Power-on/RESET mit angestecktem USB.
+//   2. Taster >= MAINTENANCE_HOLD_MS halten (weckt ein schlafendes Board).
+// Beide warten auf `Serial` (= DTR, geht erst hoch wenn der Host den Port
+// oeffnet), statt nach einem festen delay() aufzugeben.
 
 #include <WiFi.h>
 #include <esp_sleep.h>
@@ -24,7 +30,7 @@
 #include <Preferences.h>
 #include "esp_mac.h"
 
-#define FW_VERSION 2
+#define FW_VERSION 3
 #define MAX_BUTTONS 8
 
 // Hardcoded (Adafruit Feather ESP32-C6): A5/IO2 = RTC-GPIO, Taster gegen GND.
@@ -33,6 +39,12 @@ static const unsigned long MAINTENANCE_HOLD_MS = 5000;
 static const unsigned long MAINTENANCE_MS = 60000;
 // Wie lange der Config-Modus bei angestecktem USB ohne Kommando offen bleibt.
 static const unsigned long CONFIG_IDLE_MS = 600000;  // 10 min
+// Wie lange nach Power-on/RESET auf den USB-Host gewartet wird. `Serial` (DTR)
+// geht erst hoch, wenn der Host den Port oeffnet — und nach einem RESET muss er
+// das Geraet dafuer erst neu enumerieren (~0,5-1,5 s). Mit den frueheren 200 ms
+// war das Fenster praktisch immer verpasst: ein konfiguriertes Board schlief
+// nach ~250 ms wieder ein und war per Builder gar nicht mehr erreichbar.
+static const unsigned long USB_WAIT_MS = 3000;
 
 // ---- Laufzeit-Config (aus NVS) ----
 Preferences prefs;
@@ -243,7 +255,8 @@ void setup() {
 
   if (cause != ESP_SLEEP_WAKEUP_GPIO && cause != ESP_SLEEP_WAKEUP_TIMER) {
     // Power-on / Reset / USB: Config-Fenster.
-    delay(200);  // kurz auf USB-CDC-Host warten
+    unsigned long usbWait = millis();
+    while (!Serial && millis() - usbWait < USB_WAIT_MS) { delay(10); }
     if (Serial || !isConfigured()) {
       bool runNow = configMode();
       if (!runNow) {
@@ -271,6 +284,7 @@ void runButton() {
       enterDeepSleep();
     }
     Serial.println("GPIO wakeup - button pressed");
+    bool fromConfigRun = false;
 
     gpio_pullup_en(WAKEUP_PIN);
     unsigned long pressStart = millis();
@@ -281,11 +295,22 @@ void runButton() {
       Serial.printf("Long press - MAINTENANCE %lu ms (USB live)\n", MAINTENANCE_MS);
       unsigned long relStart = millis();
       while (gpio_get_level(WAKEUP_PIN) == 0 && millis() - relStart < 30000) { delay(50); }
-      delay(MAINTENANCE_MS);
-      enterDeepSleep();
+      // Auf den Host warten statt blind zu schlafen. Das Fenster hat zwei Nutzer:
+      // der Provisioner braucht nur ein Geraet am USB-Bus (esptool), der Builder
+      // zusaetzlich die Kommandoschleife. Frueher lief hier ein stumpfes
+      // delay(MAINTENANCE_MS) — das Board war sichtbar, antwortete aber auf
+      // nichts. Oeffnet niemand den Port, bleibt es beim reinen Flash-Wecker.
+      unsigned long waitStart = millis();
+      while (!Serial && millis() - waitStart < MAINTENANCE_MS) { delay(10); }
+      if (!Serial) enterDeepSleep();
+      fromConfigRun = configMode();
+      if (!fromConfigRun) enterDeepSleep();
+      // RUN: faellt in die Test-Sendung durch.
     }
 
-    if (cfgCooldownUs > 0 && lastSendUs > 0) {
+    // Nach RUN bewusst ohne Cooldown: der Techniker hat die Test-Sendung
+    // gerade explizit ausgeloest.
+    if (!fromConfigRun && cfgCooldownUs > 0 && lastSendUs > 0) {
       struct timeval tv; gettimeofday(&tv, NULL);
       uint64_t nowUs = (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
       if (nowUs > lastSendUs && (nowUs - lastSendUs) < cfgCooldownUs) {
