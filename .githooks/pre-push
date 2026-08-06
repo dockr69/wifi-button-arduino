@@ -12,4 +12,19 @@ echo "pre-push: py_compile + pytest ($DIR) …"
 "$PY" -m py_compile "$DIR/wifi_button_builder.py"
 "$PY" -m pytest "$DIR/tests/" -q
 
+# Bug-Gate (pyflakes-Klasse via ruff). Faengt genau das, was py_compile NICHT
+# sieht: undefinierte Namen (F821/F823), doppelte Defs (F811), `is` auf Literal
+# (F632), kaputte %-Formate (F50x) — Fehler, die erst zur Laufzeit knallen,
+# u. U. in einem Zweig, den kein Test anfaesst.
+#
+# Kosmetik bleibt bewusst draussen (F401 ungenutzter Import, F541, F841):
+# Stil, kein Fehler — ein lautes Gate wird ignoriert.
+if RUFF="$(command -v ruff)" || { command -v uvx >/dev/null 2>&1 && RUFF="uvx ruff"; }; then
+  echo "pre-push: ruff (Bug-Klasse) …"
+  $RUFF check --select F --ignore F401,F541,F841 .
+else
+  echo "pre-push: ruff nicht installiert — übersprungen."
+  echo "          (brew install ruff  oder  pip install ruff)"
+fi
+
 echo "pre-push: OK"
