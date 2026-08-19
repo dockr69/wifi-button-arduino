@@ -9,9 +9,9 @@
 //   MAC?            -> "MAC <aa:bb:..>"
 //   VER?            -> "VER wbtn <FW>"
 //   CFG?            -> aktuelle Config als key=val-Zeilen + "END"
-//   SET <key> <val> -> Wert puffern (Preferences); <val> darf leer sein
-//                      ("SET pass " loescht das Passwort -> offenes WLAN)
-//   SAVE            -> committen -> "OK saved"
+//   SET <key> <val> -> Wert im RAM puffern (noch NICHT im NVS); <val> darf leer
+//                      sein ("SET pass " loescht das Passwort -> offenes WLAN)
+//   SAVE            -> gepufferte Werte ins NVS schreiben -> "OK saved"
 //   CLEAR           -> Config löschen -> "OK cleared"
 //   RUN             -> Config-Modus verlassen
 // USB angesteckt (Power-on/Reset) => Config-Modus. Batterie-Wake (GPIO/Timer)
@@ -20,8 +20,19 @@
 // Zwei Wege in den Config-Modus:
 //   1. Power-on/RESET mit angestecktem USB.
 //   2. Taster >= MAINTENANCE_HOLD_MS halten (weckt ein schlafendes Board).
-// Beide warten auf `Serial` (= DTR, geht erst hoch wenn der Host den Port
-// oeffnet), statt nach einem festen delay() aufzugeben.
+// Beide pollen `Serial`, statt nach einem festen delay() aufzugeben.
+//
+// Was `Serial` auf diesem Chip WIRKLICH bedeutet (haeufiger Irrtum):
+// Der C6 hat nur USB-Serial-JTAG, also Arduinos HWCDC — und dort ist
+// `operator bool()` == `isCDC_Connected()` == `usb_serial_jtag_is_connected()`
+// (SOF-Watchdog) plus ein `connected`-Flag aus dem TX/RX-Interrupt. Also:
+// "USB haengt an einem Host", NICHT "eine Anwendung hat den Port geoeffnet".
+// DTR spielt keine Rolle (das gilt fuer TinyUSB-CDC, z.B. S3). Daraus folgt:
+//   - Nach Power-on ist `Serial` erst nach der Enumeration true, und der ERSTE
+//     Aufruf liefert oft noch false (er armt nur die TX-Interrupts) — deshalb
+//     pollen statt einmal nach festem delay() zu pruefen.
+//   - `if (!Serial)` beendet den Config-Modus beim ABZIEHEN des Kabels, nicht
+//     beim Schliessen des Ports. Das Fenster ist real CONFIG_IDLE_MS lang.
 
 #include <WiFi.h>
 #include <esp_sleep.h>
@@ -30,7 +41,7 @@
 #include <Preferences.h>
 #include "esp_mac.h"
 
-#define FW_VERSION 3
+#define FW_VERSION 4
 #define MAX_BUTTONS 8
 
 // Hardcoded (Adafruit Feather ESP32-C6): A5/IO2 = RTC-GPIO, Taster gegen GND.
@@ -39,11 +50,11 @@ static const unsigned long MAINTENANCE_HOLD_MS = 5000;
 static const unsigned long MAINTENANCE_MS = 60000;
 // Wie lange der Config-Modus bei angestecktem USB ohne Kommando offen bleibt.
 static const unsigned long CONFIG_IDLE_MS = 600000;  // 10 min
-// Wie lange nach Power-on/RESET auf den USB-Host gewartet wird. `Serial` (DTR)
-// geht erst hoch, wenn der Host den Port oeffnet — und nach einem RESET muss er
-// das Geraet dafuer erst neu enumerieren (~0,5-1,5 s). Mit den frueheren 200 ms
-// war das Fenster praktisch immer verpasst: ein konfiguriertes Board schlief
-// nach ~250 ms wieder ein und war per Builder gar nicht mehr erreichbar.
+// Wie lange nach Power-on/RESET auf den USB-Host gewartet wird: die Enumeration
+// braucht ~0,5-1,5 s, und `Serial` wird erst danach true (siehe Kopf). Mit den
+// frueheren 200 ms + Einmal-Pruefung war das Fenster praktisch immer verpasst:
+// ein konfiguriertes Board schlief nach ~250 ms wieder ein und war per Builder
+// gar nicht mehr erreichbar.
 static const unsigned long USB_WAIT_MS = 3000;
 
 // ---- Laufzeit-Config (aus NVS) ----
@@ -157,6 +168,60 @@ void dumpConfig() {
   Serial.println("END");
 }
 
+// ---- SET-Puffer ----
+// SET schreibt bewusst NICHT sofort ins NVS. Frueher tat es das, obwohl das
+// Protokoll "puffern" versprach: brach die Uebertragung in der Mitte ab (oder
+// lehnte das Board einen Wert ab, worauf der Builder vor dem SAVE aussteigt),
+// blieb ein halb umkonfiguriertes Geraet zurueck — waehrend der Builder
+// "nicht gespeichert" meldete. Jetzt ist SAVE der einzige Commit-Punkt.
+// 14 feste Keys + 4 je Button (MAX_BUTTONS) + Reserve.
+static const int MAX_PENDING = 64;
+String pendKey[MAX_PENDING], pendVal[MAX_PENDING];
+int pendCount = 0;
+
+void pendingClear() {
+  for (int i = 0; i < pendCount; i++) { pendKey[i] = ""; pendVal[i] = ""; }
+  pendCount = 0;
+}
+
+// true = gepuffert, false = Puffer voll. Ein erneutes SET auf denselben Key
+// ueberschreibt den gepufferten Wert (letztes SET gewinnt).
+bool pendingPut(const String& key, const String& val) {
+  for (int i = 0; i < pendCount; i++) {
+    if (pendKey[i] == key) { pendVal[i] = val; return true; }
+  }
+  if (pendCount >= MAX_PENDING) return false;
+  pendKey[pendCount] = key;
+  pendVal[pendCount] = val;
+  pendCount++;
+  return true;
+}
+
+// Gepufferte Werte ins NVS schreiben. Ein einziges begin()/end() um den ganzen
+// Satz — nicht eins pro Wert.
+void pendingCommit() {
+  if (!pendCount) return;
+  prefs.begin("wbtn", false);
+  for (int i = 0; i < pendCount; i++) {
+    const String& key = pendKey[i];
+    const String& val = pendVal[i];
+    // Typed keys -> richtige Preferences-Typen
+    if (key == "wifitmo" || key == "httptmo" || key == "repint")
+      prefs.putULong(key.c_str(), (uint32_t)val.toInt());
+    else if (key == "cooldn")
+      prefs.putULong64(key.c_str(), strtoull(val.c_str(), NULL, 10));
+    else if (key == "repcnt" || key == "wakepin" || key == "btncnt" ||
+             key.endsWith("port"))
+      prefs.putInt(key.c_str(), (int)val.toInt());
+    else if (key == "psave")
+      prefs.putBool(key.c_str(), val.toInt() != 0);
+    else
+      prefs.putString(key.c_str(), val);
+  }
+  prefs.end();
+  pendingClear();
+}
+
 void handleSet(const String& rest) {
   // Ein LEERER Wert ist gueltig ("SET pass " -> Passwort loeschen, offenes
   // WLAN). Frueher fiel das auf "ERR set" und der alte NVS-Wert ueberlebte
@@ -165,20 +230,10 @@ void handleSet(const String& rest) {
   String key = (sp < 0) ? rest : rest.substring(0, sp);
   String val = (sp < 0) ? String("") : rest.substring(sp + 1);
   if (!key.length()) { Serial.println("ERR set"); return; }
-  prefs.begin("wbtn", false);
-  // Typed keys -> richtige Preferences-Typen
-  if (key == "wifitmo" || key == "httptmo" || key == "repint")
-    prefs.putULong(key.c_str(), (uint32_t)val.toInt());
-  else if (key == "cooldn")
-    prefs.putULong64(key.c_str(), strtoull(val.c_str(), NULL, 10));
-  else if (key == "repcnt" || key == "wakepin" || key == "btncnt" ||
-           key.endsWith("port"))
-    prefs.putInt(key.c_str(), (int)val.toInt());
-  else if (key == "psave")
-    prefs.putBool(key.c_str(), val.toInt() != 0);
-  else
-    prefs.putString(key.c_str(), val);
-  prefs.end();
+  // NVS-Keys sind auf 15 Zeichen begrenzt — laengere wuerden beim Commit still
+  // scheitern, also hier ablehnen, solange der Builder noch abbrechen kann.
+  if (key.length() > 15) { Serial.println("ERR set"); return; }
+  if (!pendingPut(key, val)) { Serial.println("ERR set"); return; }
   Serial.println("OK");
 }
 
@@ -186,11 +241,14 @@ void handleSet(const String& rest) {
 // verbunden ist. Rückgabe true = RUN (sofort in den Betrieb).
 bool configMode() {
   Serial.printf("CFG? WBTN FW=%d configured=%d\n", FW_VERSION, isConfigured() ? 1 : 0);
+  pendingClear();  // frischer Puffer pro Sitzung
   unsigned long lastActivity = millis();
   String line;
   for (;;) {
-    // USB weg -> Config-Modus verlassen (verhindert Batterie-Dauerlauf bei
-    // unkonfigurierten Boards). Mit USB bleibt er offen, bis SAVE/RUN/Idle.
+    // Kabel ab -> Config-Modus verlassen (verhindert Batterie-Dauerlauf bei
+    // unkonfigurierten Boards). `!Serial` heisst hier "kein USB-Host mehr" und
+    // NICHT "Port geschlossen" (siehe Kopf) — ein Builder, der den Port zu- und
+    // wieder aufmacht, wirft das Board also nicht aus dem Config-Modus.
     if (!Serial) return false;
 
     while (Serial.available()) {
@@ -210,13 +268,20 @@ bool configMode() {
           } else if (cmd == "CFG?") {
             dumpConfig();
           } else if (cmd == "SAVE") {
+            pendingCommit();  // erst hier landet irgendetwas im NVS
             loadConfig();
             Serial.println("OK saved");
           } else if (cmd == "CLEAR") {
+            pendingClear();
             prefs.begin("wbtn", false); prefs.clear(); prefs.end();
             loadConfig();
             Serial.println("OK cleared");
           } else if (cmd == "RUN") {
+            if (pendCount) {
+              Serial.printf("WARN %d ungespeicherte(r) Wert(e) verworfen (kein SAVE)\n",
+                            pendCount);
+              pendingClear();
+            }
             Serial.println("OK run");
             return true;
           } else if (line.startsWith("SET ")) {
@@ -258,11 +323,9 @@ void setup() {
     unsigned long usbWait = millis();
     while (!Serial && millis() - usbWait < USB_WAIT_MS) { delay(10); }
     if (Serial || !isConfigured()) {
-      bool runNow = configMode();
-      if (!runNow) {
-        if (!isConfigured()) { enterDeepSleep(); }  // nichts zu tun
-        enterDeepSleep();  // konfiguriert: auf echten Tastendruck warten
-      }
+      // Ohne RUN gibt es hier nichts zu tun: unkonfiguriert fehlt das Ziel,
+      // konfiguriert wartet das Board auf einen echten Tastendruck.
+      if (!configMode()) enterDeepSleep();
       // RUN: fällt in runButton() durch (Test-Sendung)
     } else {
       enterDeepSleep();
@@ -295,11 +358,12 @@ void runButton() {
       Serial.printf("Long press - MAINTENANCE %lu ms (USB live)\n", MAINTENANCE_MS);
       unsigned long relStart = millis();
       while (gpio_get_level(WAKEUP_PIN) == 0 && millis() - relStart < 30000) { delay(50); }
-      // Auf den Host warten statt blind zu schlafen. Das Fenster hat zwei Nutzer:
-      // der Provisioner braucht nur ein Geraet am USB-Bus (esptool), der Builder
-      // zusaetzlich die Kommandoschleife. Frueher lief hier ein stumpfes
-      // delay(MAINTENANCE_MS) — das Board war sichtbar, antwortete aber auf
-      // nichts. Oeffnet niemand den Port, bleibt es beim reinen Flash-Wecker.
+      // Auf den USB-Host warten statt blind zu schlafen. Das Fenster hat zwei
+      // Nutzer: der Provisioner braucht nur ein Geraet am USB-Bus (esptool),
+      // der Builder zusaetzlich die Kommandoschleife. Frueher lief hier ein
+      // stumpfes delay(MAINTENANCE_MS) — das Board war sichtbar, antwortete
+      // aber auf nichts. Haengt kein Host dran, bleibt es beim reinen
+      // Flash-Wecker: MAINTENANCE_MS wach, dann Deep Sleep (wie vorher).
       unsigned long waitStart = millis();
       while (!Serial && millis() - waitStart < MAINTENANCE_MS) { delay(10); }
       if (!Serial) enterDeepSleep();

@@ -5,8 +5,7 @@
 set -e
 
 DIR="wifi-button-builder"
-PY="$DIR/.venv/bin/python"
-[ -x "$PY" ] || PY="python3"
+PY="python3"
 
 echo "pre-push: py_compile + pytest ($DIR) …"
 "$PY" -m py_compile "$DIR/wifi_button_builder.py"

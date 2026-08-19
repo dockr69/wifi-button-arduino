@@ -136,10 +136,13 @@ Only needed on macOS/Linux, or for development. On Windows use the released
 ```bash
 git clone https://github.com/dockr69/wifi-button-arduino.git
 cd wifi-button-arduino/wifi-button-builder
-python3 -m venv .venv && . .venv/bin/activate
-pip install pyserial
+python3 -m pip install pyserial   # einziges zusätzliches Paket
 python3 wifi_button_builder.py
 ```
+
+No venv needed. The builder uses only the standard library plus pyserial
+(loaded on demand). If pyserial is missing, the app still starts and shows a
+dialog with the install command.
 
 ### 2. Linux serial permissions
 

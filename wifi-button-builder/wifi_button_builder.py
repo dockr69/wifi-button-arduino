@@ -724,13 +724,20 @@ def _read_until(ser, needle: str, timeout: float) -> str:
 
 
 def _open_config_port(ser) -> None:
-    """DTR/RTS assertieren — NICHT als Reset, sondern als CDC-Verbindungssignal.
+    """Leitungen in die Ruhelage bringen und den Port kurz einschwingen lassen.
 
-    Das Base-Image verlässt den Config-Modus bei `if (!Serial) return false;`.
-    Auf dem ESP32-C6 (USB CDC On Boot) spiegelt Arduinos `Serial`-bool die
-    DTR-Leitung: ohne gesetztes DTR hält das Board die USB-Verbindung für weg
-    und geht sofort schlafen. Ein *Reset* ist über DTR/RTS dagegen nicht
-    möglich (dafür bräuchte es die esptool-JTAG-Sequenz) — ein bereits
+    Wichtig, weil hier lange das Gegenteil stand: Arduinos `Serial`-bool
+    spiegelt auf dem ESP32-C6 NICHT die DTR-Leitung. Der C6 hat nur
+    USB-Serial-JTAG, also HWCDC, und dort ist `operator bool()` ==
+    `isCDC_Connected()` == `usb_serial_jtag_is_connected()` (SOF-Watchdog) plus
+    ein Flag aus dem TX/RX-Interrupt — es bedeutet "USB hängt an einem Host",
+    nicht "eine Anwendung hat den Port geöffnet". Die DTR-Semantik gilt für
+    TinyUSB-CDC (z. B. ESP32-S3), nicht hier.
+
+    Praktische Folgen: Das Board fällt erst aus dem Config-Modus, wenn das
+    Kabel abgezogen wird oder CONFIG_IDLE_MS (10 min) abläuft — Port zu und
+    wieder auf ist unkritisch. Ein *Reset* ist über DTR/RTS weiterhin nicht
+    möglich (dafür bräuchte es die esptool-JTAG-Sequenz): ein bereits
     eingeschlafenes Board holt nur die RESET-Taste zurück."""
     try:
         ser.dtr = True
@@ -758,8 +765,10 @@ def _handshake(ser, log_cb) -> bool:
     if not resp.strip():
         log_cb("  Das Board ist komplett stumm — es schläft vermutlich (Deep Sleep).")
         log_cb("  Der Builder kann einen ESP32-C6 nicht per Software aufwecken.")
-        log_cb("  → RESET-Taste drücken (oder ab-/anstecken) und innerhalb von")
-        log_cb("    60 s erneut senden.")
+        log_cb("  → RESET-Taste drücken (oder ab-/anstecken), dann erneut senden.")
+        log_cb("    Das Board bleibt danach ~10 min im Config-Modus, solange")
+        log_cb("    das USB-Kabel steckt — Eile ist nicht nötig.")
+        log_cb("  → Alternativ ohne RESET: Taster ≥ 5 s halten.")
     else:
         log_cb(f"  Empfangen wurde: {resp.strip()[:200]}")
         log_cb("  Das sieht nicht nach dem Base-Image aus — falsche Firmware?")
@@ -788,6 +797,10 @@ def send_config_serial(port: str, cfg: dict, log_cb) -> bool:
             # Jede SET-Quittung auswerten: das Base-Image antwortet "OK" bzw.
             # "ERR set". Früher wurde gar nicht gelesen — abgelehnte Werte
             # blieben unsichtbar und der Techniker las trotzdem "✓ gespeichert".
+            # Ab FW 4 puffert das Board die SETs im RAM und schreibt erst beim
+            # SAVE ins NVS; ein Abbruch hier lässt die alte Config also intakt.
+            # Bei FW <= 3 landete jedes SET sofort im NVS — ein Abbruch konnte
+            # dort ein halb umkonfiguriertes Board hinterlassen.
             failed = []
             for k, v in pairs:
                 ser.reset_input_buffer()
@@ -2674,6 +2687,35 @@ class WifiButtonBuilder(tk.Tk):
         update_btn()
 
 
-if __name__ == "__main__":
+def _ensure_pyserial() -> bool:
+    """pyserial wird erst beim Senden/Lesen/Auflisten geladen (lazy import).
+    Fehlt es, fällt das stillschweigend aus — deshalb hier ein klarer
+    ehrlicher Hinweis statt stummer Fehlanzeige im Status-Bereich."""
+    try:
+        import serial  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def main():
+    root = tk.Tk()
+    root.withdraw()
+    if not _ensure_pyserial():
+        messagebox.showerror(
+            "pyserial fehlt",
+            "Der Builder braucht das Python-Paket 'pyserial' (kostenloses "
+            "Third-Party-Paket für USB-Serial).\n\n"
+            "Installieren (einmalig, direkt mit dem System-Python):\n"
+            "    python3 -m pip install pyserial\n\n"
+            "Danach neu starten.",
+        )
+        root.destroy()
+        sys.exit(2)
+    root.destroy()
     app = WifiButtonBuilder()
     app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
