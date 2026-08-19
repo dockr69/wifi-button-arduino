@@ -487,6 +487,24 @@ def _devices_table_exists(con) -> bool:
     ).fetchone() is not None
 
 
+def wb_known_macs() -> set[str]:
+    """Jede MAC, die die geteilte DB überhaupt kennt — wifi_buttons UND devices.
+
+    Anders als wb_mac_labels() (die nur MACs mit *Text* zurückgibt) zählt hier
+    schon der bloße devices-Eintrag: mars-provisioner legt beim Base-Image-Flash
+    einen devices-Datensatz mit freetext='' an (Tasterort kommt erst später aus
+    PTouch) — ohne diese Funktion fiel so eine MAC aus jedem "bekannte Geräte"-
+    Dropdown, sobald das Board nicht mehr am USB-Port hing."""
+    macs: set[str] = set()
+    with wb_conn() as con:
+        for (mac,) in con.execute("SELECT mac FROM wifi_buttons"):
+            macs.add(_norm_mac(mac))
+        if _devices_table_exists(con):
+            for (mac,) in con.execute("SELECT mac FROM devices"):
+                macs.add(_norm_mac(mac))
+    return macs
+
+
 def wb_mac_labels() -> dict[str, str]:
     """mac → 'Kunde / Standort · Tasterort' for every MAC in the shared DB.
 
@@ -2416,9 +2434,13 @@ class WifiButtonBuilder(tk.Tk):
         # board is recognisable without remembering its MAC.
         labels = wb_mac_labels()
         # Union: connected boards, then every MAC known to the shared DB
-        # (flashed devices AND MACs only tagged in PTouch).
+        # (flashed devices, MACs only tagged in PTouch, and devices freshly
+        # base-image-geflasht vom mars-provisioner — die haben oft noch keinen
+        # Label-Text, sonst wb_known_macs() statt wb_mac_labels().keys() nutzen,
+        # sonst verschwinden sie aus dem Dropdown sobald das Board nicht mehr
+        # am USB-Port hängt).
         seen, mac_values = set(), []
-        for m in self._connected_macs + wb_macs() + list(labels.keys()):
+        for m in self._connected_macs + wb_macs() + sorted(wb_known_macs()):
             if m in seen:
                 continue
             seen.add(m)

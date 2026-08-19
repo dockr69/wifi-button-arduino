@@ -100,6 +100,31 @@ def test_records_without_mac_are_skipped(fresh_db):
     assert (added, updated) == (0, 0)
 
 
+def test_mac_known_includes_devices_with_empty_freetext(fresh_db):
+    """mars-provisioner legt beim reinen Base-Image-Flash einen devices-Eintrag
+    an, dessen freetext (Tasterort) noch leer ist ('', nicht NULL) — bis das
+    Etikett in PTouch beschriftet wird. So eine MAC muss trotzdem als bekannt
+    gelten, sonst verschwindet sie aus dem Builder-Dropdown, sobald das Board
+    nicht mehr am USB-Port hängt."""
+    import sqlite3
+
+    with sqlite3.connect(w.DB_PATH) as con:
+        con.execute("""
+            CREATE TABLE devices (
+                mac TEXT PRIMARY KEY, sn_num INTEGER, sn TEXT,
+                device_label TEXT, first_seen TEXT, freetext TEXT,
+                board_type TEXT
+            )
+        """)
+        con.execute(
+            "INSERT INTO devices (mac, sn_num, sn, device_label, first_seen, "
+            "freetext, board_type) VALUES (?,1,'SN-00001','Taster','2026-01-01',"
+            "'','wifi')", ("AA:BB:CC:00:00:09",))
+        con.commit()
+
+    assert "AA:BB:CC:00:00:09" in w.wb_known_macs()
+
+
 def test_update_from_read_preserves_metadata_and_flash_count(fresh_db):
     # Existing device, flashed twice.
     w.wb_register("AA:BB:CC:00:00:01", _cfg("Kasse 1"), ino="// k")
