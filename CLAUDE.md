@@ -78,14 +78,16 @@ Das WLAN-Passwort gibt das Base-Image bei `CFG?` bewusst **nicht** aus.
   Bis FW 3 schrieb jedes `SET` sofort ins NVS — ein Abbruch mittendrin hinterließ
   ein halb umkonfiguriertes Board, während der Builder „nicht gespeichert" meldete.
   `RUN` ohne `SAVE` verwirft den Puffer (mit `WARN`-Zeile).
-- **`Serial` ist NICHT DTR** — häufiger Irrtum, stand hier lange falsch. Der C6
-  hat nur USB-Serial-JTAG, also HWCDC: `operator bool()` == `isCDC_Connected()`
-  == `usb_serial_jtag_is_connected()` (SOF-Watchdog) + ein Flag aus dem
-  TX/RX-Interrupt. Es heißt **„USB hängt an einem Host"**, nicht „Port ist
-  geöffnet". Die DTR-Semantik gilt für TinyUSB-CDC (S3), nicht hier. Folgen:
-  Port zu/auf wirft das Board **nicht** aus dem Config-Modus (nur Kabel ab oder
-  `CONFIG_IDLE_MS`), und der erste `Serial`-Test nach dem Boot liefert oft noch
-  `false` — deshalb pollen (`USB_WAIT_MS`), nie einmalig nach festem `delay()`.
+- **Config-Modus hängt an `Serial.isPlugged()`, NICHT an `Serial`** (ab FW 5).
+  Der C6 hat nur USB-Serial-JTAG (HWCDC): `Serial`/`isCDC_Connected()` ist
+  `isPlugged()` (SOF-Watchdog) **UND** ein `connected`-Flag, das erst der
+  IN_EMPTY-/RX-Interrupt setzt — also erst, wenn ein Programm den Port offen hat
+  und liest. Bis FW 4 wartete `setup()` darauf: nach Power-on/RESET hat niemand
+  den Port offen → konfiguriertes Board schlief nach `USB_WAIT_MS` (3 s) ein.
+  `isPlugged()` heißt nur „USB hängt an einem Host"; kann kurz flattern, daher
+  wird „Kabel ab" entprellt (`USB_GONE_MS`). DTR spielt keine Rolle. Port
+  zu/auf wirft das Board nicht aus dem Config-Modus (nur Kabel ab oder
+  `CONFIG_IDLE_MS`).
 - **Ein Reset ist über DTR/RTS trotzdem nicht möglich** — dafür bräuchte es die
   esptool-JTAG-Sequenz. Ein Board, das den Config-Modus verlassen hat
   (`CONFIG_IDLE_MS`, 10 min ohne Kommando → Deep Sleep), holt nur die

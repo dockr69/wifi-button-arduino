@@ -20,19 +20,19 @@
 // Zwei Wege in den Config-Modus:
 //   1. Power-on/RESET mit angestecktem USB.
 //   2. Taster >= MAINTENANCE_HOLD_MS halten (weckt ein schlafendes Board).
-// Beide pollen `Serial`, statt nach einem festen delay() aufzugeben.
+// Beide pollen usbHostPresent() (SOF), statt nach festem delay() aufzugeben.
 //
-// Was `Serial` auf diesem Chip WIRKLICH bedeutet (haeufiger Irrtum):
-// Der C6 hat nur USB-Serial-JTAG, also Arduinos HWCDC — und dort ist
-// `operator bool()` == `isCDC_Connected()` == `usb_serial_jtag_is_connected()`
-// (SOF-Watchdog) plus ein `connected`-Flag aus dem TX/RX-Interrupt. Also:
-// "USB haengt an einem Host", NICHT "eine Anwendung hat den Port geoeffnet".
-// DTR spielt keine Rolle (das gilt fuer TinyUSB-CDC, z.B. S3). Daraus folgt:
-//   - Nach Power-on ist `Serial` erst nach der Enumeration true, und der ERSTE
-//     Aufruf liefert oft noch false (er armt nur die TX-Interrupts) — deshalb
-//     pollen statt einmal nach festem delay() zu pruefen.
-//   - `if (!Serial)` beendet den Config-Modus beim ABZIEHEN des Kabels, nicht
-//     beim Schliessen des Ports. Das Fenster ist real CONFIG_IDLE_MS lang.
+// Warum NICHT `Serial` (bis FW 4 falsch, Board schlief nach ~3 s ein):
+// Der C6 hat nur USB-Serial-JTAG, also Arduinos HWCDC. Dort ist
+// `operator bool()` == `isCDC_Connected()` == isPlugged() (SOF-Watchdog) UND
+// ein `connected`-Flag, das erst der IN_EMPTY-/RX-Interrupt setzt — also erst,
+// wenn der Host tatsaechlich Daten abholt oder schickt. Das tut er nur, wenn ein
+// Programm den Port OFFEN hat. Nach Power-on/RESET hat aber niemand den Port
+// offen (der Builder oeffnet ihn erst beim Senden) -> `Serial` blieb false und
+// ein konfiguriertes Board ging nach USB_WAIT_MS in den Deep Sleep.
+// `Serial.isPlugged()` dagegen heisst nur "USB haengt an einem Host" (SOF
+// kommt an) — genau die Bedingung, die wir wollen. DTR spielt keine Rolle.
+// isPlugged() kann laut Core kurz flattern, deshalb wird "Kabel ab" entprellt.
 
 #include <WiFi.h>
 #include <esp_sleep.h>
@@ -41,7 +41,7 @@
 #include <Preferences.h>
 #include "esp_mac.h"
 
-#define FW_VERSION 4
+#define FW_VERSION 5
 #define MAX_BUTTONS 8
 
 // Hardcoded (Adafruit Feather ESP32-C6): A5/IO2 = RTC-GPIO, Taster gegen GND.
@@ -51,11 +51,21 @@ static const unsigned long MAINTENANCE_MS = 60000;
 // Wie lange der Config-Modus bei angestecktem USB ohne Kommando offen bleibt.
 static const unsigned long CONFIG_IDLE_MS = 600000;  // 10 min
 // Wie lange nach Power-on/RESET auf den USB-Host gewartet wird: die Enumeration
-// braucht ~0,5-1,5 s, und `Serial` wird erst danach true (siehe Kopf). Mit den
-// frueheren 200 ms + Einmal-Pruefung war das Fenster praktisch immer verpasst:
-// ein konfiguriertes Board schlief nach ~250 ms wieder ein und war per Builder
-// gar nicht mehr erreichbar.
+// braucht ~0,5-1,5 s, erst danach kommen SOFs an (siehe Kopf).
 static const unsigned long USB_WAIT_MS = 3000;
+// So lange muss isPlugged() durchgehend false sein, bis "Kabel ab" gilt.
+static const unsigned long USB_GONE_MS = 500;
+
+// USB-Host vorhanden (SOF-Watchdog) — unabhaengig davon, ob ein Programm den
+// Port geoeffnet hat. Siehe Kopf, warum hier nicht `Serial` steht.
+static bool usbHostPresent() { return Serial.isPlugged(); }
+
+// Wartet bis zu `ms` auf einen USB-Host.
+static bool waitForUsbHost(unsigned long ms) {
+  unsigned long start = millis();
+  while (!usbHostPresent() && millis() - start < ms) { delay(10); }
+  return usbHostPresent();
+}
 
 // ---- Laufzeit-Config (aus NVS) ----
 Preferences prefs;
@@ -243,13 +253,18 @@ bool configMode() {
   Serial.printf("CFG? WBTN FW=%d configured=%d\n", FW_VERSION, isConfigured() ? 1 : 0);
   pendingClear();  // frischer Puffer pro Sitzung
   unsigned long lastActivity = millis();
+  unsigned long unpluggedSince = 0;
   String line;
   for (;;) {
     // Kabel ab -> Config-Modus verlassen (verhindert Batterie-Dauerlauf bei
-    // unkonfigurierten Boards). `!Serial` heisst hier "kein USB-Host mehr" und
-    // NICHT "Port geschlossen" (siehe Kopf) — ein Builder, der den Port zu- und
-    // wieder aufmacht, wirft das Board also nicht aus dem Config-Modus.
-    if (!Serial) return false;
+    // unkonfigurierten Boards). Entprellt, weil isPlugged() kurz flattern kann.
+    // Port zu/auf im Builder aendert daran nichts (siehe Kopf).
+    if (!usbHostPresent()) {
+      if (!unpluggedSince) unpluggedSince = millis();
+      else if (millis() - unpluggedSince > USB_GONE_MS) return false;
+    } else {
+      unpluggedSince = 0;
+    }
 
     while (Serial.available()) {
       char c = (char)Serial.read();
@@ -297,7 +312,7 @@ bool configMode() {
     }
     // Idle-Timeout nur für bereits konfigurierte Geräte (dann schlafen).
     // Bewusst grosszuegig (CONFIG_IDLE_MS, nicht MAINTENANCE_MS): der eigentliche
-    // Schutz gegen Batterie-Dauerlauf ist `!Serial` oben. Mit 60 s schlief ein
+    // Schutz gegen Batterie-Dauerlauf ist "Kabel ab" oben. Mit 60 s schlief ein
     // Board, das der Techniker nur kurz liegen liess, waehrend der Arbeit ein —
     // und ein ESP32-C6 (USB-Serial-JTAG) laesst sich vom Host NICHT per DTR/RTS
     // aufwecken, d.h. nur die RESET-Taste holt es zurueck.
@@ -320,9 +335,7 @@ void setup() {
 
   if (cause != ESP_SLEEP_WAKEUP_GPIO && cause != ESP_SLEEP_WAKEUP_TIMER) {
     // Power-on / Reset / USB: Config-Fenster.
-    unsigned long usbWait = millis();
-    while (!Serial && millis() - usbWait < USB_WAIT_MS) { delay(10); }
-    if (Serial || !isConfigured()) {
+    if (waitForUsbHost(USB_WAIT_MS) || !isConfigured()) {
       // Ohne RUN gibt es hier nichts zu tun: unkonfiguriert fehlt das Ziel,
       // konfiguriert wartet das Board auf einen echten Tastendruck.
       if (!configMode()) enterDeepSleep();
@@ -364,9 +377,7 @@ void runButton() {
       // stumpfes delay(MAINTENANCE_MS) — das Board war sichtbar, antwortete
       // aber auf nichts. Haengt kein Host dran, bleibt es beim reinen
       // Flash-Wecker: MAINTENANCE_MS wach, dann Deep Sleep (wie vorher).
-      unsigned long waitStart = millis();
-      while (!Serial && millis() - waitStart < MAINTENANCE_MS) { delay(10); }
-      if (!Serial) enterDeepSleep();
+      if (!waitForUsbHost(MAINTENANCE_MS)) enterDeepSleep();
       fromConfigRun = configMode();
       if (!fromConfigRun) enterDeepSleep();
       // RUN: faellt in die Test-Sendung durch.
